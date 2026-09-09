@@ -32,8 +32,11 @@ jobs:
             dockerfile: Dockerfile.relay
             context: .
           - image: worldmonitor-redis-rest
-            dockerfile: docker/Dockerfile.redis-rest
-            context: .
+            dockerfile: Dockerfile.redis-rest
+            # docker-compose.yml builds this one with context: docker (not repo
+            # root) — Dockerfile.redis-rest does `COPY redis-rest-proxy.mjs .`
+            # with no path prefix, so it only resolves from inside docker/.
+            context: docker
 
     steps:
       - uses: actions/checkout@v6
