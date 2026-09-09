@@ -1,0 +1,65 @@
+name: Build self-hosted stack images
+
+# Builds the three images the self-hosted docker-compose.yml stack actually
+# needs (worldmonitor, ais-relay, redis-rest) and pushes them to this fork's
+# own GHCR namespace. Deliberately does NOT reuse docker-publish.yml, which
+# builds docker/Dockerfile — a thin frontend-only client pointed at the
+# hosted SaaS API (api.worldmonitor.app), not the self-hosted path. See
+# SELF_HOSTING.md / docker-compose.yml for the authoritative service list.
+#
+# linux/amd64 only — the target k3s cluster is all x86_64.
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - image: worldmonitor
+            dockerfile: Dockerfile
+            context: .
+          - image: worldmonitor-ais-relay
+            dockerfile: Dockerfile.relay
+            context: .
+          - image: worldmonitor-redis-rest
+            dockerfile: docker/Dockerfile.redis-rest
+            context: .
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
