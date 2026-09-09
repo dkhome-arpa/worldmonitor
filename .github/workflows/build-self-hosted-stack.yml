@@ -1,9 +1,11 @@
 name: Build self-hosted stack images
 
-# Builds the three images the self-hosted docker-compose.yml stack actually
-# needs (worldmonitor, ais-relay, redis-rest) and pushes them to this fork's
-# own GHCR namespace. Deliberately does NOT reuse docker-publish.yml, which
-# builds docker/Dockerfile — a thin frontend-only client pointed at the
+# Builds the four images the self-hosted stack needs (worldmonitor, ais-relay,
+# redis-rest, and a seeders image for ./scripts/run-seeders.sh — SELF_HOSTING.md
+# documents seeders as running "on the host", so they get their own image
+# rather than piggybacking on the trimmed runtime one) and pushes them to this
+# fork's own GHCR namespace. Deliberately does NOT reuse docker-publish.yml,
+# which builds docker/Dockerfile — a thin frontend-only client pointed at the
 # hosted SaaS API (api.worldmonitor.app), not the self-hosted path. See
 # SELF_HOSTING.md / docker-compose.yml for the authoritative service list.
 #
@@ -41,6 +43,9 @@ jobs:
             # root) — Dockerfile.redis-rest does `COPY redis-rest-proxy.mjs .`
             # with no path prefix, so it only resolves from inside docker/.
             context: docker
+          - image: worldmonitor-seeders
+            dockerfile: Dockerfile.seeders
+            context: .
 
     steps:
       - uses: actions/checkout@v6
