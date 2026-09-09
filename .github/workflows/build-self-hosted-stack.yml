@@ -32,7 +32,11 @@ jobs:
             dockerfile: Dockerfile.relay
             context: .
           - image: worldmonitor-redis-rest
-            dockerfile: Dockerfile.redis-rest
+            # `file:` is resolved relative to the working directory (repo root),
+            # NOT relative to `context:`, even though context is set below —
+            # that's docker buildx's own behavior, not an action quirk. Needs
+            # the full path here despite context already being docker/.
+            dockerfile: docker/Dockerfile.redis-rest
             # docker-compose.yml builds this one with context: docker (not repo
             # root) — Dockerfile.redis-rest does `COPY redis-rest-proxy.mjs .`
             # with no path prefix, so it only resolves from inside docker/.
