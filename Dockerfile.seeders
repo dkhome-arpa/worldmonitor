@@ -1,0 +1,32 @@
+# =============================================================================
+# World Monitor — Seeders Image
+# =============================================================================
+# SELF_HOSTING.md documents seeders as running "on the host" against the
+# Redis REST proxy, not inside any of the compose containers — the main
+# Dockerfile's runtime stage deliberately excludes scripts/ and most of
+# node_modules. This image exists so a scheduler (Kubernetes CronJob, cron,
+# etc.) can run ./scripts/run-seeders.sh without a host Node install.
+#
+# Single stage, no build step: scripts/*.mjs are plain ESM, not compiled.
+# =============================================================================
+
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
+
+# coreutils gives the real GNU `timeout` run-seeders.sh looks for
+# (SEED_TIMEOUT wall-clock cap per seeder) — Alpine's busybox timeout applet
+# is not guaranteed to match its -k/signal behavior.
+RUN apk add --no-cache coreutils
+
+WORKDIR /app
+
+# Full production dependency graph — seed scripts import SDKs (redis, AWS,
+# Anthropic, etc.) from package.json's "dependencies", not the trimmed
+# runtime-package.json the main image uses.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
+# Seed scripts reach across the tree (scripts/, scripts/shared/, data/), so
+# copy the full source rather than guessing a subset.
+COPY . .
+
+CMD ["./scripts/run-seeders.sh"]
