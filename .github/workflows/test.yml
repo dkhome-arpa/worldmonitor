@@ -256,7 +256,7 @@ jobs:
     # Always-on: derives build-owned inventory facts and validates fixed or
     # semantic documentation contracts. Runs on every PR/push (docs-only PRs
     # set changes.code=false and skip `unit`, so this must not gate on it).
-    # Pure Node builtins — no npm install required.
+    # Docs date generation uses the existing YAML parser for OpenAPI pages.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -275,6 +275,7 @@ jobs:
         run: node scripts/docs-stats.mjs --check
       - name: Generate and validate docs page dates for this revision
         run: |
+          npm ci --ignore-scripts --prefer-offline
           node scripts/generate-docs-page-dates.mjs
           node scripts/generate-docs-page-dates.mjs --check
           node --test tests/docs-page-dates.test.mjs
@@ -742,6 +743,15 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ steps.playwright-version.outputs.version }}
+      - name: Use Ubuntu repositories for browser OS libraries
+        # Playwright needs Ubuntu libraries. Unrelated Chrome repository index
+        # failures must not prevent their installation on this disposable runner.
+        run: |
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          printf '%s\n' \
+            'Dir::Etc::sourcelist "/etc/apt/sources.list.d/ubuntu.sources";' \
+            'Dir::Etc::sourceparts "-";' \
+            | sudo tee /etc/apt/apt.conf.d/99-playwright-sources
       - run: npx playwright install --with-deps chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       # The cache restores only browser binaries (~/.cache/ms-playwright), not
@@ -846,6 +856,15 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ steps.playwright-version.outputs.version }}
+      - name: Use Ubuntu repositories for browser OS libraries
+        # Playwright needs Ubuntu libraries. Unrelated Chrome repository index
+        # failures must not prevent their installation on this disposable runner.
+        run: |
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          printf '%s\n' \
+            'Dir::Etc::sourcelist "/etc/apt/sources.list.d/ubuntu.sources";' \
+            'Dir::Etc::sourceparts "-";' \
+            | sudo tee /etc/apt/apt.conf.d/99-playwright-sources
       - run: npx playwright install --with-deps chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       # The cache restores only browser binaries (~/.cache/ms-playwright), not
@@ -919,6 +938,22 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: playwright-pro-cls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+      # Named explicitly for the same reason as the gates above: nothing runs
+      # the e2e/ glob, so an unnamed spec would never execute. It reads the same
+      # public/pro/ bytes the build step above produced.
+      - name: Run /pro hero native-animation gate
+        id: pro-hero
+        run: npm run test:e2e:pro-hero
+      # Its own upload: Playwright clears test-results/ when the next run
+      # starts, so a later step would delete this gate's failure trace.
+      - name: Upload /pro hero animation Playwright artifacts
+        if: ${{ !cancelled() && steps.pro-hero.outcome != 'skipped' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: playwright-pro-hero-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
           if-no-files-found: ignore
           retention-days: 14

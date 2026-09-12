@@ -645,6 +645,21 @@ export interface TransmissionNode {
   logic: string;
 }
 
+export interface ListWsbTickersRequest {
+}
+
+export interface ListWsbTickersResponse {
+  tickers: WsbTicker[];
+}
+
+export interface WsbTicker {
+  symbol: string;
+  mentionCount: number;
+  totalScore: number;
+  subreddits: string[];
+  velocityScore: number;
+}
+
 export interface GetSocialVelocityRequest {
 }
 
@@ -762,7 +777,9 @@ export interface ComputeEnergyShockScenarioResponse {
   degraded: boolean;
   chokepointConfidence: string;
   liveFlowRatio?: number;
+  /** @deprecated */
   gasImpact?: GasImpact;
+  gasSensitivity?: GasSensitivity;
 }
 
 export interface ProductImpact {
@@ -788,6 +805,28 @@ export interface GasStorageBuffer {
   fillPct: number;
   gasTwh: number;
   bufferDays: number;
+  trend: string;
+  date: string;
+  scope: string;
+}
+
+export interface GasSensitivity {
+  lngShareOfImports?: number;
+  lngImportsTj: number;
+  lngDisruptionTj: number;
+  totalDemandTj: number;
+  deficitPct: number;
+  dataAvailable: boolean;
+  assessment: string;
+  storage?: GasStorageObservation;
+  dataSource: string;
+  dataMonth: string;
+  modelBasis: string;
+}
+
+export interface GasStorageObservation {
+  fillPct: number;
+  gasTwh: number;
   trend: string;
   date: string;
   scope: string;
@@ -1739,6 +1778,29 @@ export class IntelligenceServiceClient {
     }
 
     return await resp.json() as ListMarketImplicationsResponse;
+  }
+
+  async listWsbTickers(_req: ListWsbTickersRequest, options?: IntelligenceServiceCallOptions): Promise<ListWsbTickersResponse> {
+    let path = "/api/intelligence/v1/list-wsb-tickers";
+    const url = this.baseURL + path;
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.defaultHeaders,
+      ...options?.headers,
+    };
+
+    const resp = await this.fetchFn(url, {
+      method: "GET",
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!resp.ok) {
+      return this.handleError(resp);
+    }
+
+    return await resp.json() as ListWsbTickersResponse;
   }
 
   async getSocialVelocity(_req: GetSocialVelocityRequest, options?: IntelligenceServiceCallOptions): Promise<GetSocialVelocityResponse> {

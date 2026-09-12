@@ -1685,7 +1685,23 @@ async function fetchBoundedTextWithStatus(fetchFn, url, sourceContract, diagnost
   if (!isAllowedSourceUrl(url, sourceContract)) {
     throw new Error('UNSAFE_SOURCE_URL');
   }
-  const response = await fetchFn(url, boundedHtmlRequestInit(sourceContract));
+  let response;
+  try {
+    response = await fetchFn(url, boundedHtmlRequestInit(sourceContract));
+  } catch (error) {
+    if (diagnostic?.transport === 'proxy') {
+      const details = error?.proxyFailure;
+      diagnostic.stage = ['proxy_connection', 'proxy_connect', 'target_tls', 'response_headers', 'response_body']
+        .includes(details?.stage) ? details.stage : 'unknown';
+      diagnostic.httpStatus = diagnostic.stage === 'response_body'
+        && Number.isInteger(details?.httpStatus) && details.httpStatus >= 100 && details.httpStatus <= 599
+        ? details.httpStatus : null;
+      diagnostic.proxyConnectStatus = ['proxy_connect', 'target_tls'].includes(diagnostic.stage)
+        && Number.isInteger(details?.proxyConnectStatus) && details.proxyConnectStatus >= 100 && details.proxyConnectStatus <= 599
+        ? details.proxyConnectStatus : null;
+    }
+    throw error;
+  }
   if (diagnostic) {
     diagnostic.httpStatus = response.status;
     diagnostic.stage = response.ok ? 'response_body' : 'response_headers';
@@ -2221,6 +2237,14 @@ function errorCode(error) {
   return 'SOURCE_ERROR';
 }
 
+function isMndTransportFailure(code, diagnostic) {
+  // The proxy buffers bodies before returning, so its generic failures have no known stage.
+  return code === 'TIMEOUT'
+    || (code === 'SOURCE_ERROR' && diagnostic.transport !== 'proxy'
+      && diagnostic.stage === 'response_headers'
+      && diagnostic.httpStatus === null);
+}
+
 function boundedDiagnosticString(value, maxChars = PROXY_DIAGNOSTIC_MAX_CHARS) {
   if (typeof value !== 'string') return null;
   const normalized = value
@@ -2620,7 +2644,7 @@ export async function fetchCrossStraitActivitySnapshot({
     ? (input, init) => fetchMndViaProxy(input, init, mndProxyConfig, proxyRequestFn)
     : null;
   let mndPreferredFetchFn = fetchFn;
-  const mndTimeoutRetryFetchFn = () => mndProxyFetchFn && mndPreferredFetchFn === fetchFn
+  const mndTransportRetryFetchFn = () => mndProxyFetchFn && mndPreferredFetchFn === fetchFn
     ? mndProxyFetchFn
     : fetchFn;
   const resolvedJapanProxyFetchFn = proxyUrl
@@ -2673,7 +2697,7 @@ export async function fetchCrossStraitActivitySnapshot({
           path: new URL(url).pathname, purpose: 'list', attempt: attempt + 1,
           stage: 'response_headers', httpStatus: null,
         };
-        const requestFetchFn = attempt > 0 ? mndTimeoutRetryFetchFn() : mndPreferredFetchFn;
+        const requestFetchFn = attempt > 0 ? mndTransportRetryFetchFn() : mndPreferredFetchFn;
         if (requestFetchFn === mndProxyFetchFn) diagnostic.transport = 'proxy';
         try {
           const html = await fetchBoundedText(requestFetchFn, url, mndContract, diagnostic);
@@ -2696,7 +2720,7 @@ export async function fetchCrossStraitActivitySnapshot({
           mndRequestDiagnostics.push({
             ...diagnostic, errorCode: errorCode(error), elapsedMs: Math.round(monotonicNow() - startedAt),
           });
-          if (errorCode(error) !== 'TIMEOUT' || attempt === 1
+          if (!isMndTransportFailure(errorCode(error), diagnostic) || attempt === 1
             || listRequestCount >= MND_MAX_LIST_PAGES_PER_BACKFILL_RUN
             || !hasMndOutboundBudget({ runStartedAt, nowFn, cadenceMs: REQUEST_CADENCE_MS })) {
             throw error;
@@ -2798,8 +2822,8 @@ export async function fetchCrossStraitActivitySnapshot({
         purpose: isRefresh ? 'refresh' : 'detail', attempt: retryErrorCode ? 2 : 1,
         stage: 'response_headers', httpStatus: null,
       };
-      const requestFetchFn = retryErrorCode === 'TIMEOUT'
-        ? mndTimeoutRetryFetchFn()
+      const requestFetchFn = retryErrorCode === 'TIMEOUT' || retryErrorCode === 'SOURCE_ERROR'
+        ? mndTransportRetryFetchFn()
         : mndPreferredFetchFn;
       if (requestFetchFn === mndProxyFetchFn) diagnostic.transport = 'proxy';
       let startedAt;
@@ -2830,7 +2854,7 @@ export async function fetchCrossStraitActivitySnapshot({
           ...diagnostic, errorCode: code, elapsedMs: Math.round(monotonicNow() - startedAt),
         });
         if (
-          (code === 'MND_PUBLICATION_METADATA_MISSING' || code === 'TIMEOUT')
+          (code === 'MND_PUBLICATION_METADATA_MISSING' || isMndTransportFailure(code, diagnostic))
           && !retryErrorCode
           && detailRequestCount < detailAttemptLimit
         ) {

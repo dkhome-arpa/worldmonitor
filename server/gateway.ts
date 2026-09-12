@@ -394,6 +394,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/economic/v1/get-china-macro-snapshot': 'slow',
   '/api/economic/v1/get-china-activity-nowcast': 'medium',
   '/api/intelligence/v1/list-market-implications': 'slow',
+  '/api/intelligence/v1/list-wsb-tickers': 'no-store',
   '/api/economic/v1/get-ecb-fx-rates': 'slow',
   '/api/economic/v1/get-eurostat-country-data': 'slow',
   '/api/economic/v1/get-eu-gas-storage': 'slow',
@@ -1998,14 +1999,34 @@ export function createDomainGateway(
     // Gateway rate limiting — two-phase: endpoint-specific first, then global fallback.
     // Confirmed paid principals use per-user buckets; other traffic uses IP.
     //
-    // Internal-MCP verified requests skip this gateway layer: the MCP edge
+    // Flight searches need their tighter upstream budget even after MCP admission.
+    if (internalMcpVerified && pathname === '/api/aviation/v1/search-google-flights') {
+      const endpointRlResponse = await checkEndpointRateLimit(request, pathname, corsHeaders, {
+        principalUserId: request.headers.get(TRUSTED_USER_ID_HEADER)!,
+        principalScope: 'session',
+      });
+      if (endpointRlResponse) {
+        const reason = getRateLimitTelemetryReason(endpointRlResponse, 'rate_limit_429_endpoint');
+        emitRequest(endpointRlResponse.status, reason, null);
+        return endpointRlResponse;
+      }
+    }
+
+    // Internal-MCP verified requests skip the remaining gateway layer: the MCP edge
     // already enforced 50/day + 60/min per userId in api/mcp.ts. A second
     // limiter here would create misleading double-counting and could 429
     // legitimate Pro tool fetches that pass the upstream cap.
     if (!internalMcpVerified) {
-      const endpointRlResponse = rateLimitPrincipalUserId
+      // These local provider lookups use the sidecar cache without Upstash.
+      // Keep these exceptions exact-path; cloud requests retain the provider cap.
+      const isSidecarProviderLookup = process.env.LOCAL_API_MODE === 'tauri-sidecar'
+        && (pathname === '/api/military/v1/get-wingbits-live-flight'
+          || pathname === '/api/imagery/v1/search-imagery'
+          || pathname === '/api/webcam/v1/get-webcam-image');
+      const endpointRlResponse = isSidecarProviderLookup ? null : rateLimitPrincipalUserId
         ? await checkEndpointRateLimit(request, pathname, corsHeaders, {
             principalUserId: rateLimitPrincipalUserId,
+            principalScope: isUserApiKey ? 'api_key' : 'session',
           })
         : await checkEndpointRateLimit(request, pathname, corsHeaders);
       if (endpointRlResponse) {
@@ -2153,9 +2174,15 @@ export function createDomainGateway(
       }
 
       if (!governedByApiKeyLayer && !hasEndpointRatePolicy(pathname)) {
+        // WORLDMONITOR-12A: scope the bucket to the credential, not just the
+        // user. An API key and a browser session resolve to the same Clerk id,
+        // so without this a customer's own scraper drains the 600/min budget
+        // and their dashboard 429s. In production on 2026-09-11 that was 598
+        // scraper successes against 2 for the same person's browser.
         const rateLimitResponse = rateLimitPrincipalUserId
           ? await checkRateLimit(request, corsHeaders, {
               principalUserId: rateLimitPrincipalUserId,
+              principalScope: isUserApiKey ? 'api_key' : 'session',
             })
           : await checkRateLimit(request, corsHeaders);
         if (rateLimitResponse) {

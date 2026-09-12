@@ -169,6 +169,7 @@ const HEALTH_VERDICT_COMPACT_SNAPSHOT_KEY = healthVerdictRedisKey(
   process.env.VERCEL_GIT_COMMIT_SHA,
 );
 const HEALTH_VERDICT_SNAPSHOT_TTL_SECONDS = 60;
+const CONTRACTS_FINDER_CANONICAL_KEY = 'economic:global-tenders:v1';
 // Edge runtime mirror of scripts/china-coverage-manifest.mjs. Edge functions
 // cannot import scripts/; tests enforce key and status-projection parity.
 const CHINA_COVERAGE_SUMMARY_KEY = 'health:china-coverage:v1';
@@ -1370,7 +1371,7 @@ const SEED_META = {
   energyMixAll:         { key: 'seed-meta:economic:owid-energy-mix',   maxStaleMin: 50400 }, // same seed run as energyExposure; shares seed-meta key
   regulatoryActions:    { key: 'seed-meta:regulatory:actions',          maxStaleMin: 360 }, // 2h cron; 360min = 3x interval
   energySpineCountries: { key: 'seed-meta:energy:spine',                maxStaleMin: 2880 }, // daily cron (06:00 UTC); 2880min = 48h = 2x interval
-  electricityPrices:    { key: 'seed-meta:energy:electricity-prices',   maxStaleMin: 2880 }, // daily cron (14:00 UTC); 2880min = 48h = 2x interval
+  electricityPrices:    { key: 'seed-meta:energy:electricity-prices',   maxStaleMin: 3000 }, // daily 14:00 UTC; two intervals + 2h completion margin
   gasStorageCountries:  { key: 'seed-meta:energy:gas-storage-countries', maxStaleMin: 2880 }, // daily cron at 10:30 UTC; 2880min = 48h = 2x interval
   energyIntelligence:   { key: 'seed-meta:energy:intelligence',          maxStaleMin: 720 }, // 6h cron; 720min = 2x interval
   // `chinaCoverage` opts these three into the producer diagnostic below. An
@@ -1384,7 +1385,7 @@ const SEED_META = {
   ieaOilStocks:         { key: 'seed-meta:energy:iea-oil-stocks',        maxStaleMin: 60 * 24 * 40 }, // monthly cron on 15th; 40d threshold = TTL_SECONDS
   oilStocksAnalysis:    { key: 'seed-meta:energy:oil-stocks-analysis',   maxStaleMin: 60 * 24 * 50 }, // afterPublish of ieaOilStocks; 50d = matches seed-meta TTL (exceeds 40d data TTL)
   eiaPetroleum:         { key: 'seed-meta:energy:eia-petroleum',         maxStaleMin: 4320 }, // daily bundle cron (seed-bundle-energy-sources); 72h = 3× interval, well under 7d data TTL
-  jodiGas:              { key: 'seed-meta:energy:jodi-gas',               maxStaleMin: 60 * 24 * 40, chinaRow: true }, // monthly 35d cadence; 40d = cadence + 5d late-publisher grace. Data/meta TTL is 70d (2× cadence) so last-good outlives this gate and one missed monthly publish.
+  jodiGas:              { key: 'seed-meta:energy:jodi-gas',               maxStaleMin: 60 * 24 * 40, chinaRow: true }, // 15d bundle interval; 40d allows missed runs. Data/meta TTL is 70d so last-good outlives this gate and several intervals.
   lngVulnerability:     { key: 'seed-meta:energy:jodi-gas',               maxStaleMin: 60 * 24 * 40, chinaRow: true }, // written by jodi-gas seeder afterPublish; shares seed-meta key and the 70d GAS_TTL
   chokepointBaselines:  { key: 'seed-meta:energy:chokepoint-baselines', maxStaleMin: 60 * 24 * 400 }, // 400 days
   // maxStaleMin is 120d = 2x the 60-day bundle interval, matching the repo's
@@ -2506,6 +2507,9 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
         ...finiteCoverageField('countrySpecificImportCountryCount'),
         ...finiteCoverageField('globalProductionCommodityCount'),
         ...finiteCoverageField('completeCountryCount'),
+        ...finiteCoverageField('currentCountryCount'),
+        ...finiteCoverageField('retainedCountryCount'),
+        ...finiteCoverageField('oldestCountryCacheWrittenAt'),
         ...finiteCoverageField('rankableCountryCount'),
         ...finiteCoverageField('rankableRecordCount'),
         ...finiteCoverageField('freshRankableRecordCount'),
@@ -2516,6 +2520,9 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
         retailers: coverageRetailers,
       }
     : null;
+  const coverageCompletionRatioUsable = Number.isFinite(meta?.coverage?.completionRatio)
+    && meta.coverage.completionRatio >= 0
+    && meta.coverage.completionRatio <= 1;
 
   let synthesisFailure = null;
   if (seedCfg.synthesisFailure) {
@@ -2575,6 +2582,8 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
   const chinaRow = projectJodiChinaRow(meta, seedCfg?.chinaRow);
   return {
     hasMeta: meta != null,
+    seedFetchedAt: fetchedAt,
+    targetLocationsDegraded: meta?.targetLocationsDegraded === true,
     seedAge,
     seedStale,
     seedError: sourceDegraded || failedDatasets.length > 0,
@@ -2590,6 +2599,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
     contentFreshness,
     decisionGroups,
     coverage,
+    coverageCompletionRatioUsable,
     errorCode,
     sourceFailure,
     synthesisFailure,
@@ -2617,6 +2627,7 @@ function isCascadeCovered(name, hasData, keyStrens, keyErrors) {
 function classifyKey(name, redisKey, opts, ctx) {
   const { keyStrens, keyErrors, keyMetaValues, keyMetaErrors, now } = ctx;
   const seedCfg = SEED_META[name];
+  ctx.containmentEvidenceByName?.delete(name);
   // #6095 audited this grace and DELIBERATELY kept it soft when the marker read
   // failed, unlike the content-freshness grace below. What it gates is why:
   //   1. It downgrades exactly the two "no records" verdicts — EMPTY (key
@@ -2696,6 +2707,7 @@ function classifyKey(name, redisKey, opts, ctx) {
     contentFreshness,
     decisionGroups,
     coverage,
+    coverageCompletionRatioUsable,
     errorCode,
     sourceFailure,
     synthesisFailure,
@@ -2892,9 +2904,7 @@ function classifyKey(name, redisKey, opts, ctx) {
   // producer wrote no usable block cannot prove anything about its content,
   // and "cannot prove" must never resolve to OK — that is exactly the
   // fresh-transport/complete-cardinality mask this branch exists to remove.
-  else if (seedCfg?.requireContentFreshness && !contentFreshness?.usable && !contentFreshnessPending) {
-    status = 'COVERAGE_DEGRADED';
-  }
+  else if (seedCfg?.requireContentFreshness && !contentFreshness?.usable && !contentFreshnessPending) status = 'COVERAGE_DEGRADED';
   else if (
     seedCfg?.minSuccessRate != null
     && coverage
@@ -2930,6 +2940,8 @@ function classifyKey(name, redisKey, opts, ctx) {
   else status = 'OK';
 
   const entry = { status, records };
+  // Target locations are optional; expose their failure without changing status.
+  if (name === 'ddosAttacks' && meta.targetLocationsDegraded) entry.targetLocationsDegraded = true;
   // Source-level on-demand marker: "this key is RPC-populated or awaiting its
   // first producer run", NOT "any failure here is acceptable". The status suffix
   // (`EMPTY_ON_DEMAND`) cannot carry that, because it only covers the
@@ -3055,6 +3067,34 @@ function classifyKey(name, redisKey, opts, ctx) {
       entry.lastSynthesisFailureCode = synthesisFailure.lastSynthesisFailureCode;
     }
   }
+  // Diagnostic precedence must not skip a reader requirement: every required
+  // proof is checked here, even when an earlier stale/error verdict won. This
+  // proves that the current request found a real served payload; freshness is
+  // deliberately left to the unchanged diagnostic status.
+  ctx.containmentEvidenceByName?.set(name, {
+    status,
+    records: hasData ? metaCount : null,
+    usable: Number.isFinite(seedAge) && seedAge >= 0
+      && Number.isFinite(meta.seedFetchedAt) && meta.seedFetchedAt > 0 && meta.seedFetchedAt <= now
+      && (!synthesisFailure?.servedGeneratedAt || Date.parse(synthesisFailure.servedGeneratedAt) <= now)
+      && (seedCfg?.requiredRedistributionPolicyVersion == null
+        || redistributionPolicyVersion === seedCfg.requiredRedistributionPolicyVersion)
+      && !decisionGroups?.coverageFailureInvalidReason
+      && (seedCfg?.minRankableRecordCount == null || rankableRecordCount != null)
+      && (!seedCfg?.requireVulnerabilityCoverage || (coverage
+        && Object.keys(seedCfg.requireVulnerabilityCoverage)
+          .every((field) => Number.isFinite(coverage[field]))))
+      && (!seedCfg?.minPoolCounts || poolCounts !== null)
+      && (!seedCfg?.requireCoverage || coverage !== null)
+      && (!coverage || seedCfg?.minSuccessRate == null || coverageCompletionRatioUsable)
+      && (!seedCfg?.requireContentFreshness || contentFreshness?.usable || contentFreshnessPending)
+      && (!contentAge || (Number.isFinite(contentAge.newestItemAt) && contentAge.newestItemAt <= now
+        && Number.isFinite(contentAge.contentAgeMin) && contentAge.contentAgeMin >= 0))
+      && resilienceCacheState?.ok !== false
+      // These records include missing/stale input placeholders. A positive
+      // count alone cannot prove that the reader serves a usable index.
+      && !seedCfg?.enforceInputFreshUntil,
+  });
   return entry;
 }
 
@@ -3123,6 +3163,121 @@ function healthStatusBucket(entry, now) {
     && !isExpiredDeadline(entry.staleContentGraceUntil, now)
   ) return 'ok';
   return STATUS_COUNTS[entry?.status] ?? 'warn';
+}
+
+const CONTAINMENT_ELIGIBLE_STATUSES = new Set([
+  'STALE_SEED',
+  'SEED_ERROR',
+  'STALE_CONTENT',
+  'COVERAGE_PARTIAL',
+  'COVERAGE_DEGRADED',
+  'CHINA_DEGRADED',
+]);
+
+function isContainedHealthWarning(entry, evidence, now = Date.now()) {
+  return healthStatusBucket(entry, now) === 'warn'
+    && CONTAINMENT_ELIGIBLE_STATUSES.has(entry?.status)
+    && Number.isFinite(entry?.records)
+    && (entry.records > 0 || (entry.records === 0 && evidence?.confirmedEmpty === true))
+    && evidence?.status === entry.status
+    && evidence.records === entry.records
+    && evidence.usable === true
+    && (entry.containmentUntil === undefined || !isExpiredDeadline(entry.containmentUntil, now))
+    && entry.readModelReady !== false;
+}
+
+function isUsableTender(tender) {
+  if (!tender || typeof tender !== 'object' || Array.isArray(tender)) return false;
+  const stringArray = (values) => Array.isArray(values) && values.every((value) => typeof value === 'string');
+  const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  return [tender.id, tender.title, tender.source, tender.sourceNoticeId, tender.officialUrl,
+    tender.status, tender.participationMode].every((value) => typeof value === 'string' && value.trim())
+    && [tender.countryCode, tender.region, tender.buyer, tender.description, tender.noticeType,
+      tender.publishedAt, tender.updatedAt, tender.deadline]
+      .every((value) => value === undefined || typeof value === 'string')
+    && [tender.categoryCodes, tender.sectors, tender.eligibilityRequirements, tender.submissionUrls].every(stringArray)
+    && (tender.money === undefined || (object(tender.money)
+      && (tender.money.amount === undefined || Number.isFinite(tender.money.amount))
+      && (tender.money.currency === undefined || typeof tender.money.currency === 'string')))
+    && (tender.automationFit === undefined || (object(tender.automationFit)
+      && typeof tender.automationFit.level === 'string'
+      && Number.isFinite(tender.automationFit.score)
+      && typeof tender.automationFit.classificationVersion === 'string'
+      && stringArray(tender.automationFit.matchReasons)
+      && stringArray(tender.automationFit.evidence)));
+}
+
+function composeContractsFinderHealth(entry, meta, snapshot, readFailed, now) {
+  // Source-status bytes prove a diagnostic exists, not that its tender rows
+  // still exist. Replace the generic containment proof with the served data.
+  const evidence = { status: entry.status, records: entry.records, usable: false };
+  const source = Array.isArray(snapshot?.sourceStatuses)
+    ? snapshot.sourceStatuses.find((status) => status?.source === 'contracts-finder') : null;
+  const error = meta?.error ?? source?.error;
+  const lastAttemptAt = meta?.lastAttemptAt ?? source?.fetchedAt;
+  const lastSuccessAt = meta?.lastSuccessfulAt ?? source?.lastSuccessfulAt;
+  entry = { ...entry };
+  if (typeof meta?.sourceState === 'string') entry.sourceState = meta.sourceState;
+  if (typeof error === 'string') entry.error = error.slice(0, 200);
+  if (typeof lastAttemptAt === 'string') entry.lastAttemptAt = lastAttemptAt;
+  if (typeof lastSuccessAt === 'string') entry.lastSuccessAt = lastSuccessAt;
+  if (typeof meta?.firstFailureAt === 'string') entry.firstFailureAt = meta.firstFailureAt;
+  if (Number.isSafeInteger(meta?.consecutiveFailures) && meta.consecutiveFailures >= 0) {
+    entry.consecutiveSourceFailures = meta.consecutiveFailures;
+  }
+  if (readFailed) return { entry: { ...entry, status: 'REDIS_PARTIAL' }, evidence };
+  if (snapshot === null) return { entry: { ...entry, status: 'EMPTY', records: 0 }, evidence };
+  if (meta?.sourceState === 'ok') return { entry, evidence };
+  if (['OK', 'NOT_CONFIGURED'].includes(entry.status)) entry.status = 'SEED_ERROR';
+  if (snapshot.dataAvailable !== true || !Array.isArray(snapshot.tenders) || !Array.isArray(snapshot.sourceStatuses)) {
+    return { entry: { ...entry, status: 'EMPTY_DATA', records: 0 }, evidence };
+  }
+  const sourceRows = snapshot.tenders.filter((tender) => tender?.source === 'contracts-finder');
+  const records = sourceRows.filter((tender) => {
+    if (typeof tender.id !== 'string' || !tender.id.trim()
+      || typeof tender.title !== 'string' || !tender.title.trim()
+      || ![tender.categoryCodes, tender.sectors].every((values) => Array.isArray(values) && values.every((value) => typeof value === 'string'))
+      || !['active', 'open'].includes(tender.status) || !(Date.parse(tender.deadline) > now)) return false;
+    try {
+      const url = new URL(tender.officialUrl);
+      return url.protocol === 'https:' && !url.username && !url.password
+        && (url.hostname === 'contractsfinder.service.gov.uk' || url.hostname.endsWith('.contractsfinder.service.gov.uk'));
+    } catch { return false; }
+  });
+  // Count only the currently usable rows; expiry or corruption must not be
+  // hidden by the count written at the previous scheduled attempt.
+  entry.records = records.length;
+  const success = Date.parse(meta?.lastSuccessfulAt || '');
+  const first = Date.parse(meta?.firstFailureAt || '');
+  const attempt = Date.parse(meta?.lastAttemptAt || '');
+  const validEpisode = success > 0 && success <= first && first <= attempt && attempt <= now
+    && meta.fetchedAt === success && meta.consecutiveFailures === 1;
+  const aggregateFresh = Number.isFinite(snapshot.fetchedAt) && snapshot.fetchedAt > 0
+    && snapshot.fetchedAt <= now && now < snapshot.fetchedAt + 180 * 60_000;
+  const confirmedEmpty = source?.confirmedEmpty === true && meta?.confirmedEmpty === true
+    && sourceRows.length === 0 && source.recordCount === 0 && meta.recordCount === 0
+    && snapshot.sourceStatuses.filter((status) => status?.source === 'contracts-finder').length === 1
+    && snapshot.sourceStatuses.every((status) => status && typeof status.source === 'string' && typeof status.state === 'string')
+    && ['available', 'partial', 'empty'].includes(snapshot.availability)
+    && aggregateFresh && snapshot.tenders.every(isUsableTender);
+  const aligned = (confirmedEmpty ? source.state === 'error' && meta.sourceState === 'error'
+    : source?.state === 'stale' && meta?.sourceState === 'stale')
+    && source.lastSuccessfulAt === meta.lastSuccessfulAt && source.fetchedAt === meta.lastAttemptAt
+    && source.firstFailureAt === meta.firstFailureAt && source.consecutiveFailures === meta.consecutiveFailures
+    && source.recordCount === records.length && meta.recordCount === records.length
+    && sourceRows.length === records.length && new Set(records.map((tender) => tender.id)).size === records.length;
+  const deadline = validEpisode && (records.length > 0 || confirmedEmpty)
+    ? Math.min(first + 90 * 60_000, success + SEED_META.globalTendersContractsFinder.maxStaleMin * 60_000,
+      ...(confirmedEmpty ? [snapshot.fetchedAt + 180 * 60_000] : []),
+      ...records.map((tender) => Date.parse(tender.deadline))) : NaN;
+  if (entry.status === 'SEED_ERROR' && aligned && now < deadline) {
+    entry.containmentUntil = new Date(deadline).toISOString();
+    evidence.usable = true;
+    if (confirmedEmpty) evidence.confirmedEmpty = true;
+  }
+  evidence.status = entry.status;
+  evidence.records = entry.records;
+  return { entry, evidence };
 }
 
 // Orders the buckets above so classifyKey can compare two candidate verdicts
@@ -3300,7 +3455,10 @@ function composeChinaDecisionSignalsStatus(entry, _chinaCoverageEntry, now) {
   if (validCoverageShortfall) {
     const pendingUntil = lastSuccessAt + CHINA_DECISION_SIGNALS_PENDING_MS;
     if (Number.isSafeInteger(lastSuccessAt) && now < pendingUntil) {
-      return { ...entry, chinaCoveragePendingUntil: new Date(pendingUntil).toISOString() };
+      return {
+        ...entry,
+        chinaCoveragePendingUntil: new Date(pendingUntil).toISOString(),
+      };
     }
   }
 
@@ -3309,13 +3467,20 @@ function composeChinaDecisionSignalsStatus(entry, _chinaCoverageEntry, now) {
 
 function composeScorecardReadModelStatus(entry, raw, readError = false) {
   if (!entry) return entry;
-  if (readError) return { ...entry, status: 'REDIS_PARTIAL', readModelReady: false };
+  if (readError) {
+    return { ...entry, status: 'REDIS_PARTIAL', readModelReady: false };
+  }
   const readModelReady = Number(raw) === 1;
   if (readModelReady) return { ...entry, readModelReady: true };
   if (STATUS_COUNTS[entry.status] === 'crit' || entry.status === 'SEED_ERROR') {
     return { ...entry, readModelReady: false };
   }
-  return { ...entry, status: 'COVERAGE_PARTIAL', seedStatus: entry.status, readModelReady: false };
+  return {
+    ...entry,
+    status: 'COVERAGE_PARTIAL',
+    seedStatus: entry.status,
+    readModelReady: false,
+  };
 }
 
 function parseHealthVerdictSnapshot(raw, now, { requireChecks = true } = {}) {
@@ -3390,6 +3555,7 @@ const ENTRY_SOFTENING_DEADLINES = [
   { field: 'staleContentGraceUntil', kind: 'content', status: null },
   { field: 'sourceFailurePendingUntil', kind: 'source', status: 'SEED_ERROR' },
   { field: 'chinaCoveragePendingUntil', kind: 'source', status: null },
+  { field: 'containmentUntil', kind: 'source', status: null },
 ];
 
 function entryDeadlineRaw(entry, { field, status }) {
@@ -3481,24 +3647,46 @@ function snapshotTtlSeconds(snapshot, now) {
  * ROLLOUT_PENDING is NOT — were pinned against a copy rather than against this
  * code. Subtracting a new bucket here would have kept every test green.
  *
- * `onDemandWarn` is the ONLY bucket subtracted: an on-demand key nobody has
- * requested yet is warn-level for visibility and must not flip the verdict.
- * ROLLOUT_PENDING deliberately stays inside `realWarnCount` (#6059) — it is on a
- * clock, and its escalation to crit is the deadline, not operator attention.
+ * `realWarnCount` preserves the diagnostic warning census by subtracting only
+ * on-demand misses. Availability then subtracts the explicit contained subset;
+ * those defects stay actionable in `summary.warn` and `problems`.
+ * ROLLOUT_PENDING is never contained (#6059): it stays availability-affecting
+ * until its deadline promotes a missing payload to critical.
  */
 function computeOverallStatus(counts, totalChecks) {
   const realWarnCount = counts.warn - counts.onDemandWarn;
+  const containedWarnCount = Number.isInteger(counts.containedWarn)
+    && counts.containedWarn >= 0
+    && counts.containedWarn <= realWarnCount
+    ? counts.containedWarn
+    : 0;
+  const availabilityWarnCount = realWarnCount - containedWarnCount;
   const critCount = counts.crit;
 
-  let overall;
-  if (critCount === 0 && realWarnCount === 0) overall = 'HEALTHY';
-  else if (critCount === 0) overall = 'WARNING';
-  // Degraded threshold scales with registry size so adding keys doesn't
-  // silently raise the page-out bar. ~3% of total keys (was hardcoded 3).
-  else if (critCount / totalChecks <= 0.03) overall = 'DEGRADED';
-  else overall = 'UNHEALTHY';
+  if (critCount > 0) {
+    // Critical severity is shared by both verdicts. The threshold scales with
+    // registry size so adding keys does not silently raise the page-out bar.
+    const overall = critCount / totalChecks <= 0.03 ? 'DEGRADED' : 'UNHEALTHY';
+    return {
+      overall,
+      diagnosticOverall: overall,
+      realWarnCount,
+      critCount,
+    };
+  }
 
-  return { overall, realWarnCount, critCount };
+  const diagnosticOverall = realWarnCount > 0 ? 'WARNING' : 'HEALTHY';
+  const overall = availabilityWarnCount === 0
+    && containedWarnCount / totalChecks <= 0.03
+    ? 'HEALTHY'
+    : 'WARNING';
+
+  return {
+    overall,
+    diagnosticOverall,
+    realWarnCount,
+    critCount,
+  };
 }
 
 // Failure-log / ?history=1 problem set. Distinct from the compact `problems` map
@@ -3516,6 +3704,69 @@ function collectFailureLogProblems(checks, now = Date.now()) {
     // The dedupe signature uses only key:status (no age) so a long STALE_SEED
     // window doesn't produce a new log entry on every poll.
     sigKeys: entries.map(([k, c]) => `${k}:${c.status}`).sort(),
+  };
+}
+
+function buildFailureLogPersistencePlan({
+  verdict,
+  diagnostics,
+  containedWarnCount,
+  previousSignature,
+  now,
+}) {
+  const {
+    overall: availabilityOverall,
+    diagnosticOverall,
+    critCount,
+    realWarnCount: warnCount,
+  } = verdict;
+  const { problemKeys, sigKeys } = diagnostics;
+
+  if (problemKeys.length === 0) {
+    // A later recurrence of the same problem set is a new incident only after
+    // a diagnostic recovery, independent of the public availability verdict.
+    return {
+      action: 'clear',
+      commands: [['DEL', 'health:failure-log-sig']],
+    };
+  }
+
+  const entry = {
+    at: new Date(now).toISOString(),
+    status: diagnosticOverall,
+    ...(diagnosticOverall !== availabilityOverall
+      ? { availabilityStatus: availabilityOverall, containedWarnCount }
+      : {}),
+    critCount,
+    warnCount,
+    problems: problemKeys,
+  };
+  const signature = `${diagnosticOverall}|${sigKeys.join(',')}`;
+  const appendIncident = signature !== previousSignature;
+  const commands = [
+    ['SET', 'health:last-failure', JSON.stringify(entry), 'EX', 86400],
+  ];
+
+  if (appendIncident) {
+    commands.push(
+      ['LPUSH', 'health:failure-log', JSON.stringify(entry)],
+      ['LTRIM', 'health:failure-log', 0, 49],
+    );
+  }
+
+  // Refresh history and its signature together while an incident is active:
+  // neither duplicate it after 24h nor lose its only history entry after 7d.
+  commands.push(
+    ['EXPIRE', 'health:failure-log', 86400 * 7],
+    ['SET', 'health:failure-log-sig', signature, 'EX', 86400],
+  );
+
+  return {
+    action: 'persist',
+    appendIncident,
+    entry,
+    signature,
+    commands,
   };
 }
 
@@ -3804,6 +4055,7 @@ export async function handleHealth(req, ctx, options = {}) {
   for (const key of CANADA_ALERTS_CUTOVER_FALLBACK_KEYS) {
     if (!allDataKeys.includes(key)) allDataKeys.push(key);
   }
+  if (!allDataKeys.includes(CONTRACTS_FINDER_CANONICAL_KEY)) allDataKeys.push(CONTRACTS_FINDER_CANONICAL_KEY);
   const allMetaKeys = Object.values(SEED_META).map(s => s.key);
   const activationEntries = Object.entries(ACTIVATION_MARKERS);
   const fredRolloutCommands = fredRatesRolloutCommands(now);
@@ -3853,6 +4105,19 @@ export async function handleHealth(req, ctx, options = {}) {
   // sweep finished, so a request that spends time awaiting Redis cannot keep a
   // grace it has already outlived. Injected clocks stay fixed so unit tests
   // remain deterministic.
+  // Only a failed Contracts Finder refresh needs a row-level proof. Keep
+  // ordinary sweeps on STRLEN; a failure reads this one canonical snapshot.
+  const contractsFinderMetaResult = results[allDataKeys.length + allMetaKeys.indexOf(SEED_META.globalTendersContractsFinder.key)];
+  const contractsFinderMeta = unwrapEnvelope(parseRedisValue(contractsFinderMetaResult?.result)).data;
+  const contractsFinderDataResult = results[allDataKeys.indexOf(CONTRACTS_FINDER_CANONICAL_KEY)];
+  const contractsFinderHasData = keyHasData(CONTRACTS_FINDER_CANONICAL_KEY, contractsFinderDataResult?.result ?? 0);
+  let contractsFinderSnapshot = contractsFinderHasData ? undefined : null;
+  let contractsFinderReadFailed = Boolean(contractsFinderMetaResult?.error || contractsFinderDataResult?.error);
+  if (!contractsFinderReadFailed && contractsFinderHasData && contractsFinderMeta?.sourceState !== 'ok') {
+    const payload = await redisPipeline([['GET', CONTRACTS_FINDER_CANONICAL_KEY]], 4_000, true).catch(() => null);
+    contractsFinderReadFailed = !payload || Boolean(payload[0]?.error);
+    contractsFinderSnapshot = unwrapEnvelope(parseRedisValue(payload?.[0]?.result)).data;
+  }
   const evaluationNow = snapshotNow();
 
   // keyStrens: byte length per data key (0 = missing/empty/sentinel)
@@ -3915,7 +4180,9 @@ export async function handleHealth(req, ctx, options = {}) {
     rolloutPendingUntilMs.set('fredRatesSeeder', fredRatesRolloutUntil);
   }
 
+  const containmentEvidenceByName = new Map();
   const classifyCtx = {
+    containmentEvidenceByName,
     keyStrens,
     keyErrors,
     keyMetaValues,
@@ -3928,7 +4195,16 @@ export async function handleHealth(req, ctx, options = {}) {
   };
   const checks = {};
   const contentFreshnessPendingUntil = {};
-  const counts = { ok: 0, warn: 0, onDemandWarn: 0, staleContent: 0, rolloutPending: 0, pending: 0, crit: 0 };
+  const counts = {
+    ok: 0,
+    warn: 0,
+    containedWarn: 0,
+    onDemandWarn: 0,
+    staleContent: 0,
+    rolloutPending: 0,
+    pending: 0,
+    crit: 0,
+  };
   let totalChecks = 0;
 
   const sources = [
@@ -3939,6 +4215,11 @@ export async function handleHealth(req, ctx, options = {}) {
     for (const [name, redisKey] of Object.entries(registry)) {
       totalChecks++;
       let entry = classifyKey(name, redisKey, opts, classifyCtx);
+      if (name === 'globalTendersContractsFinder') {
+        const composed = composeContractsFinderHealth(entry, contractsFinderMeta, contractsFinderSnapshot, contractsFinderReadFailed, evaluationNow);
+        entry = composed.entry;
+        containmentEvidenceByName.set(name, composed.evidence);
+      }
       if (name === 'chinaCoverage') {
         entry = composeChinaCoverageStatus(
           entry,
@@ -3946,6 +4227,13 @@ export async function handleHealth(req, ctx, options = {}) {
           Boolean(chinaCoverageResult?.error),
           evaluationNow,
         );
+        const evidence = containmentEvidenceByName.get(name);
+        const evaluatedAt = Date.parse(entry.evaluatedAt ?? '');
+        if (evidence && evidence.records === entry.records
+          && Number.isFinite(evaluatedAt) && evaluatedAt <= evaluationNow
+          && !entry.problems?.some((problem) => problem.status === 'unavailable')) {
+          evidence.status = entry.status;
+        }
       }
       if (name === 'scorecardFiveFactor') {
         entry = composeScorecardReadModelStatus(
@@ -3993,9 +4281,13 @@ export async function handleHealth(req, ctx, options = {}) {
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(graceCleanup);
   }
 
-  for (const entry of Object.values(checks)) {
+  for (const [name, entry] of Object.entries(checks)) {
     const bucket = healthStatusBucket(entry, evaluationNow);
     counts[bucket]++;
+    const evidence = containmentEvidenceByName.get(name);
+    if (isContainedHealthWarning(entry, evidence, evaluationNow)) {
+      counts.containedWarn++;
+    }
     if (isPendingHealthEntry(entry, evaluationNow)) counts.pending++;
     if (entry.status === 'EMPTY_ON_DEMAND') counts.onDemandWarn++;
     // STALE_CONTENT = "seeder is fresh but the upstream DATA stopped advancing"
@@ -4009,49 +4301,38 @@ export async function handleHealth(req, ctx, options = {}) {
     if (entry.status === 'ROLLOUT_PENDING') counts.rolloutPending++;
   }
 
-  const { overall, realWarnCount, critCount } = computeOverallStatus(counts, totalChecks);
+  const {
+    overall,
+    diagnosticOverall,
+    realWarnCount,
+    critCount,
+  } = computeOverallStatus(counts, totalChecks);
 
-  if (overall !== 'HEALTHY') {
-    // problemKeys includes seedAgeMin for the snapshot (useful for post-mortem),
-    // but the dedupe signature uses only key:status (no age) so a long STALE_SEED
-    // window doesn't produce a new log entry on every poll.
-    const { problemKeys, sigKeys } = collectFailureLogProblems(checks, evaluationNow);
-    console.log('[health] %s problems=[%s]', overall, problemKeys.join(', '));
-    const failureLogEntry = {
-      at: new Date(evaluationNow).toISOString(),
-      status: overall,
-      critCount,
-      warnCount: realWarnCount,
-      problems: problemKeys,
-    };
-    // Dedupe: only LPUSH when the incident signature (status + problem set,
-    // excluding seedAgeMin) changes. Read the previous sig first, then write
-    // everything (last-failure + sig + LPUSH) in one atomic pipeline so the
-    // sig only advances when the LPUSH succeeds. If the pipeline fails, the
-    // sig stays stale and the next poll retries the append.
-    const sig = `${overall}|${sigKeys.join(',')}`;
-    const prevSigResult = await redisPipeline([['GET', 'health:failure-log-sig']], 4_000).catch(() => null);
-    const prevSig = prevSigResult?.[0]?.result ?? '';
-    const persistCmds = [
-      ['SET', 'health:last-failure', JSON.stringify(failureLogEntry), 'EX', 86400],
-    ];
-    if (sig !== prevSig) {
-      persistCmds.push(
-        ['LPUSH', 'health:failure-log', JSON.stringify(failureLogEntry)],
-        ['LTRIM', 'health:failure-log', 0, 49],
-        ['EXPIRE', 'health:failure-log', 86400 * 7],
-        ['SET', 'health:failure-log-sig', sig, 'EX', 86400],
-      );
-    }
-    const persist = redisPipeline(persistCmds, 4_000).catch(() => {});
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
-  } else {
-    // Clear the sig on recovery so a recurrence of the same problem set
-    // after a healthy gap is logged as a new incident, not deduped against
-    // the previous one.
-    const clear = redisPipeline([['DEL', 'health:failure-log-sig']], 4_000).catch(() => {});
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(clear);
+  // Incident history follows actionable diagnostics, not the public
+  // availability verdict. A contained defect may intentionally leave uptime
+  // HEALTHY, but it must remain visible to operators and strict monitors.
+  const diagnostics = collectFailureLogProblems(checks, evaluationNow);
+  const { problemKeys } = diagnostics;
+  if (problemKeys.length > 0) {
+    console.log('[health] %s problems=[%s]', diagnosticOverall, problemKeys.join(', '));
   }
+  const persistFailureLog = async () => {
+    let previousSignature = '';
+    if (problemKeys.length > 0) {
+      const result = await redisPipeline([['GET', 'health:failure-log-sig']], 4_000).catch(() => null);
+      previousSignature = result?.[0]?.result ?? '';
+    }
+    const persistencePlan = buildFailureLogPersistencePlan({
+      verdict: { overall, diagnosticOverall, realWarnCount, critCount },
+      diagnostics,
+      containedWarnCount: counts.containedWarn,
+      previousSignature,
+      now: evaluationNow,
+    });
+    await redisPipeline(persistencePlan.commands, 4_000).catch(() => {});
+  };
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persistFailureLog());
+  else await persistFailureLog();
 
   const verdictSnapshot = {
     status: overall,
@@ -4061,6 +4342,10 @@ export async function handleHealth(req, ctx, options = {}) {
       // `warn` excludes on-demand-empty (cosmetic warns); `onDemandWarn` is
       // surfaced separately so readers can reconcile against `overall`.
       warn: realWarnCount,
+      // Subset of `warn`: actionable source defects that still prove a usable
+      // metadata-backed payload. These remain in `problems` even when the
+      // small-cohort availability verdict stays HEALTHY.
+      containedWarn: counts.containedWarn,
       onDemandWarn: counts.onDemandWarn,
       // `staleContent` counts every STALE_CONTENT diagnosis (fresh seeder,
       // frozen upstream data — issue #3845), so a frozen feed is visible
@@ -4127,6 +4412,15 @@ export async function handleHealth(req, ctx, options = {}) {
   // only the verdict payload is reused, for at most 60 seconds. All other
   // responses already carry the no-store defaults from `headers` (a cached
   // 401 pins an auth failure; a cached 503 masks REDIS_DOWN recovery).
+  // Persistence can cross a tender deadline after classification. The cached
+  // snapshot is already rejected at that deadline; recheck the cold response too.
+  const contractsFinder = checks.globalTendersContractsFinder;
+  if (contractsFinder?.containmentUntil
+    && isContainedHealthWarning(contractsFinder, containmentEvidenceByName.get('globalTendersContractsFinder'), evaluationNow)
+    && isExpiredDeadline(contractsFinder.containmentUntil, snapshotNow())) {
+    verdictSnapshot.summary.containedWarn--;
+    verdictSnapshot.status = computeOverallStatus({ ...counts, containedWarn: verdictSnapshot.summary.containedWarn }, totalChecks).overall;
+  }
   return healthResponse(verdictSnapshot, compact, headers);
 }
 
@@ -4139,10 +4433,12 @@ export default async function handler(req, ctx) {
 // the classifier without standing up the full bootstrap-keys + Redis pipeline.
 // 2026-05-04 health-readiness plan, Sprint 1 test plan (Codex round 2 P1).
 export const __testing__ = {
+  composeContractsFinderHealth,
   readSeedMeta,
   classifyKey,
   healthResponseBody,
   collectFailureLogProblems,
+  buildFailureLogPersistencePlan,
   ACTIVATION_MARKERS,
   CONTENT_FRESHNESS_ROLLOUT_UNTIL_MS,
   RUNTIME_ROLLOUT_PENDING_POLICIES,
@@ -4159,6 +4455,7 @@ export const __testing__ = {
   staleContentGraceUntilMs,
   applyStaleContentGrace,
   healthStatusBucket,
+  isContainedHealthWarning,
   computeOverallStatus,
   hasExpiredActivationGrace,
   snapshotTtlSeconds,

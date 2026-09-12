@@ -91,6 +91,46 @@ function event(value: string, filenames: string[] = []): PolicyEvent {
   };
 }
 
+/**
+ * The checkout catch on this surface reports with an ownership tag
+ * (`kind: 'checkout_request_failed'`). A tag can only be honoured by a filter
+ * that runs late enough to read it: `ignoreErrors` is applied as an SDK event
+ * processor inside `prepareEvent`, before `marketingBeforeSend` and blind to
+ * both tags and frames, so a network-worded entry there silently discards an
+ * owned checkout failure. The retry widening shipped to this bundle makes those
+ * exact wordings more reachable, so the suppression has to move late enough to
+ * see the tag (WORLDMONITOR-Q4).
+ */
+describe('marketingBeforeSend — owned network failures survive (WORLDMONITOR-Q4)', () => {
+  const CHECKOUT_TAGS = {
+    surface: 'pro-marketing',
+    code: 'service_unavailable',
+    kind: 'checkout_request_failed',
+  };
+
+  for (const [type, value] of [
+    ['TypeError', 'Failed to fetch'],
+    ['TypeError', 'Load failed'],
+    ['TypeError', 'NetworkError when attempting to fetch resource.'],
+  ]) {
+    it(`keeps "${type}: ${value}" once checkout has claimed it`, () => {
+      assert.equal(
+        isIgnored(type, value),
+        false,
+        `"${value}" must not be dropped by ignoreErrors — that layer cannot see the ownership tag`,
+      );
+      const owned = { ...event(`${type}: ${value}`), tags: { ...CHECKOUT_TAGS } };
+      assert.equal(marketingBeforeSend(owned), owned);
+    });
+
+    it(`still drops "${type}: ${value}" with no first-party report`, () => {
+      // The counter-fixture. Moving the pattern must not widen it: an untagged
+      // network failure stays as suppressed as it was in ignoreErrors.
+      assert.equal(marketingBeforeSend(event(`${type}: ${value}`)), null);
+    });
+  }
+});
+
 describe('marketing ignoreErrors', () => {
   it('drops the WKWebView host-bridge timeout (WORLDMONITOR-ZY)', () => {
     assert.equal(
@@ -438,6 +478,118 @@ describe('marketing ignoreErrors — in-app-browser injected globals (2026-08-27
     assert.equal(isIgnored('Error', 'Java object is missing'), false);
     assert.equal(isIgnored('Error', 'Our Java gateway is gone'), false);
   });
+
+  it("drops the Java bridge's other Chromium reason (WORLDMONITOR-126)", () => {
+    // Verbatim production value: Chrome Mobile 153 on Android 10 at `/`, fired
+    // through Sentry's `setTimeout` instrumentation from an injected
+    // `scanForForms` autofill scan, with only the `/pro/assets/sentry-*.js`
+    // chunk and one `<anonymous>` on the stack.
+    //
+    // `GinJavaBridgeError` has more than one member, and the dashboard array
+    // enumerates two of them (`src/bootstrap/sentry-init.ts`). #7356 copied
+    // only `Java object is gone` to this surface, so the second reason fell
+    // through to a separate issue on the marketing client. The reasons stay
+    // ENUMERATED rather than slotted: a Chromium reason we have not seen should
+    // surface as a new issue and be added deliberately, because
+    // under-suppression announces itself and over-suppression does not.
+    assert.equal(
+      isIgnored('Error', 'Error invoking log: Java bridge method invocation error'),
+      true,
+    );
+    // The method slot is shape-matched here too, per the entry above.
+    assert.equal(
+      isIgnored('Error', 'Error invoking 获取设备信息: Java bridge method invocation error'),
+      true,
+    );
+  });
+
+  it('keeps a first-party message that merely CONTAINS the second reason', () => {
+    // Same control as the `Java object is gone` half: `ignoreErrors` is
+    // frame-blind, so only the complete anchored Chromium sentence may match.
+    assert.equal(isIgnored('Error', 'Java bridge method invocation error'), false);
+    assert.equal(
+      isIgnored('Error', 'Relay failed: Java bridge method invocation error'),
+      false,
+    );
+    assert.equal(
+      isIgnored('Error', 'Error invoking log: Java bridge method invocation error (retrying)'),
+      false,
+    );
+  });
+
+  it('keeps an unenumerated Chromium reason so it surfaces as a new issue', () => {
+    // The safe failure direction the entry documents: a reason we have never
+    // observed must still report rather than be swallowed by a widened slot.
+    assert.equal(isIgnored('Error', 'Error invoking log: Java exception was raised'), false);
+  });
+
+  it('pins the marketing surface as `Error invoking`-free, which is what licenses the rule', () => {
+    // What licenses matching the envelope at all: a pure-web bundle owns no
+    // `@JavascriptInterface` object, so it can never emit Chromium's sentence.
+    // The dashboard test pins the same scan for its own copy.
+    const offenders = marketingFirstPartySources()
+      .filter((f) => !f.rel.includes('sentry-filter-policy'))
+      .filter((f) => /Error invoking/.test(f.code))
+      .map((f) => f.rel);
+    assert.deepEqual(offenders, [],
+      'the marketing surface now emits `Error invoking` — re-derive the WORLDMONITOR-117/-126 rule');
+  });
+});
+
+describe("MARKETING_IGNORE_ERRORS — DuckDuckGo's feature registry (WORLDMONITOR-127)", () => {
+  it('drops the registry miss the dashboard has always dropped', () => {
+    // Verbatim production value: DuckDuckGo 18.1 / macOS at `/`, captured
+    // through `onunhandledrejection` with a NULL stacktrace — zero frames, so
+    // `marketingBeforeSend`'s frame gates cannot reach it and only a message
+    // rule can. The dashboard has suppressed the same sentence since
+    // `/feature named .\w+. was not found/` landed in
+    // `src/bootstrap/sentry-init.ts`; the marketing client is a separate init,
+    // which is the gap this closes.
+    assert.equal(isIgnored('Error', 'feature named `pageContext` was not found'), true);
+  });
+
+  it('slots the feature name, because DuckDuckGo adds features per release', () => {
+    // Deliberately NOT enumerated like the `Error invoking` reasons above: the
+    // name is a third-party identifier, not a vocabulary we review member by
+    // member, so every future feature shares the one disposition.
+    assert.equal(isIgnored('Error', 'feature named `duckPlayer` was not found'), true);
+    assert.equal(isIgnored('Error', 'feature named `click-to-load` was not found'), true);
+  });
+
+  it('keeps a first-party message that merely CONTAINS the phrase', () => {
+    // `ignoreErrors` is frame-blind, so only the complete anchored sentence may
+    // match — an unanchored copy of the dashboard's entry would also swallow
+    // our own wording riding a `/pro/assets/*.js` frame.
+    assert.equal(isIgnored('Error', 'feature named `pageContext` was not found'.toUpperCase()), false);
+    assert.equal(
+      isIgnored('Error', 'Config load failed: feature named `pageContext` was not found'),
+      false,
+    );
+    assert.equal(
+      isIgnored('Error', 'feature named `pageContext` was not found (retrying)'),
+      false,
+    );
+  });
+
+  it('keeps a re-quoted future wording so it surfaces as a new issue', () => {
+    // The backticks are matched literally. If DuckDuckGo re-quotes the message
+    // it must report rather than be swallowed by a loosened delimiter — the
+    // safe failure direction this policy keeps.
+    assert.equal(isIgnored('Error', "feature named 'pageContext' was not found"), false);
+    assert.equal(isIgnored('Error', 'feature named "pageContext" was not found'), false);
+  });
+
+  it('pins the marketing surface as `feature named`-free, which is what licenses the rule', () => {
+    // What licenses a frame-blind rule at all: the registry, its wording and
+    // its features are all DuckDuckGo's, and a pure-web bundle has no such
+    // registry to miss a lookup in.
+    const offenders = marketingFirstPartySources()
+      .filter((f) => !f.rel.includes('sentry-filter-policy'))
+      .filter((f) => /feature named/.test(f.code))
+      .map((f) => f.rel);
+    assert.deepEqual(offenders, [],
+      'the marketing surface now emits `feature named` — re-derive the WORLDMONITOR-127 rule');
+  });
 });
 
 describe('marketingBeforeSend — Safari-masked injected script (WORLDMONITOR-110)', () => {
@@ -472,6 +624,62 @@ describe('marketingBeforeSend — Safari-masked injected script (WORLDMONITOR-11
     const kept = event('Attempting to change value of a readonly property.', [
       'https://www.worldmonitor.app/',
     ]);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+});
+
+describe('marketingBeforeSend — injected eval blocked by CSP (WORLDMONITOR-129)', () => {
+  // Verbatim production event: Edge 150 / Windows on `/pro`, an `onerror`
+  // capture whose only frames are two `<anonymous>:1` entries — a script
+  // evaluated by an extension, which our `script-src` (no 'unsafe-eval') refused.
+  const CSP_EVAL_MESSAGE = "Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script: script-src 'self' 'strict-dynamic' 'nonce-wm-static-bootstrap'";
+  const evalEvent = (value: string, filenames: string[]): PolicyEvent => ({
+    exception: {
+      values: [{
+        type: 'EvalError',
+        value,
+        stacktrace: { frames: filenames.map((filename) => ({ filename })) },
+      }],
+    },
+  });
+
+  it('drops the CSP eval block raised from an evaluated script', () => {
+    assert.equal(marketingBeforeSend(evalEvent(CSP_EVAL_MESSAGE, ['<anonymous>', '<anonymous>'])), null);
+  });
+
+  it("drops Safari's phrasing of the same block", () => {
+    const safari = "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed source of script in the following Content Security Policy directive: \"script-src 'self'\".";
+    assert.equal(marketingBeforeSend(evalEvent(safari, ['<anonymous>'])), null);
+  });
+
+  // Positive control for `!hasFirstParty`: if our own bundle ever reaches for
+  // eval or `new Function`, the CSP breaks that code path and it must page. It
+  // would ride a `/pro/assets/*.js` frame. Delete the gate and this goes red.
+  it('keeps the block when a marketing-bundle frame is on the stack', () => {
+    const kept = evalEvent(CSP_EVAL_MESSAGE, ['<anonymous>', '/pro/assets/index-a1b2c3.js']);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
+  // The same control for our INLINE first-party scripts (welcome.html's WebMCP
+  // bootstrap, prerender.mjs's DEFERRED_STYLES_SCRIPT): an eval they issue puts
+  // the document URL on the stack below the `<anonymous>` frame, and
+  // `hasFirstParty` does not count document frames (PR #8022 review).
+  it('keeps the block when the caller is an inline script on the marketing document', () => {
+    for (const doc of ['https://www.worldmonitor.app/', 'https://www.worldmonitor.app/pro']) {
+      const kept = evalEvent(CSP_EVAL_MESSAGE, ['<anonymous>', doc]);
+      assert.equal(marketingBeforeSend(kept), kept);
+    }
+  });
+
+  // Positive control for the evaluated-frame requirement: no frames at all is
+  // absence of evidence, not proof of injection.
+  it('keeps a frameless block', () => {
+    const kept = evalEvent(CSP_EVAL_MESSAGE, []);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
+  it('keeps an unrelated error from an evaluated script', () => {
+    const kept = evalEvent('Invalid array length', ['<anonymous>']);
     assert.equal(marketingBeforeSend(kept), kept);
   });
 });
@@ -588,8 +796,13 @@ describe('policy wiring', () => {
     const dashboard = readFileSync(resolve(root, 'src/bootstrap/sentry-init.ts'), 'utf8');
     const dashboardCount = (dashboard.match(/^\s{6}\/.*\/,\s*(\/\/.*)?$/gm) ?? []).length;
     assert.ok(dashboardCount > 100, `sanity: expected a large dashboard array, got ${dashboardCount}`);
+    // The bound is a RATCHET against bulk-copying, not a budget to spend: it
+    // moves by one, in the same commit as the entry that needs the slot, and
+    // only once that entry carries its own licence scan and suppression tests
+    // (WORLDMONITOR-127 took it from 19 to 20). Raising it by more than one, or
+    // ahead of an entry, defeats the deliberation this red is here to force.
     assert.ok(
-      MARKETING_IGNORE_ERRORS.length < 20,
+      MARKETING_IGNORE_ERRORS.length < 21,
       `marketing array must stay a vetted subset, got ${MARKETING_IGNORE_ERRORS.length}`,
     );
   });

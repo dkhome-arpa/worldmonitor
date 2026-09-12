@@ -358,6 +358,47 @@ export async function internalEntitlementsHttpHandler(
 
 const http = httpRouter();
 
+// Only the edge contact handler may write leads after its public abuse checks.
+http.route({
+  path: "/leads/submit-contact",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const expected = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    const provided = request.headers.get("x-convex-shared-secret") ?? "";
+    if (!expected || !(await timingSafeEqualStrings(provided, expected))) {
+      return Response.json({ error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body || typeof body.name !== "string" || typeof body.email !== "string"
+      || typeof body.source !== "string"
+      || [body.organization, body.phone, body.message].some(
+        (value) => value !== undefined && typeof value !== "string",
+      )) {
+      return Response.json({ error: "INVALID_CONTACT" }, { status: 400 });
+    }
+    try {
+      const result = await ctx.runMutation(internal.contactMessages.submit, {
+        name: body.name,
+        email: body.email,
+        source: body.source,
+        organization: body.organization as string | undefined,
+        phone: body.phone as string | undefined,
+        message: body.message as string | undefined,
+      });
+      return Response.json(result);
+    } catch (error) {
+      const code = extractConvexErrorCode(error);
+      if (code === "rate_limited") {
+        return Response.json({ error: code }, { status: 429 });
+      }
+      if (code === "FREE_EMAIL_NOT_ALLOWED") {
+        return Response.json({ error: code }, { status: 422 });
+      }
+      return Response.json({ error: "CONTACT_STORAGE_FAILED" }, { status: 503 });
+    }
+  }),
+});
+
 http.route({
   path: "/api/internal-register-interest",
   method: "POST",
@@ -993,8 +1034,8 @@ http.route({
       if (code === "EMAIL_OWNERSHIP_REQUIRED" || code === "PRO_REQUIRED") {
         return new Response(JSON.stringify({ error: code }), { status: code === "PRO_REQUIRED" ? 402 : 400, headers: { "Content-Type": "application/json" } });
       }
-      const msg = err instanceof Error ? err.message : String(err);
-      return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+      console.error('[notification-channels] Operation failed', err);
+      return new Response(JSON.stringify({ error: 'Operation failed' }), { status: 500, headers: { "Content-Type": "application/json" } });
     }
   }),
 });
@@ -1721,6 +1762,9 @@ http.route({
         headers: { "Content-Type": "application/json" },
       });
     } catch (err) {
+      if (extractConvexErrorCode(err) === "INVALID_CHECKOUT_PRODUCT") {
+        return Response.json({ error: "INVALID_CHECKOUT_PRODUCT" }, { status: 400 });
+      }
       const msg = err instanceof Error ? err.message : "Checkout creation failed";
       return new Response(JSON.stringify({ error: msg }), {
         status: 500,
