@@ -15,6 +15,7 @@ const stubs: Record<string, string> = {
     "export const CANADA_ARCTIC_OPT_IN_SOURCES = ['Globe and Mail', 'Global News', 'Yle News', 'NRK', 'Aftenposten', 'DR Nyheder', 'Arctic Today'];",
     "export const CANADA_DEPTH_OPT_IN_SOURCES = [];",
     "export const CRISIS_FLOOR_OPT_IN_SOURCES = ['WAFA English'];",
+    "export const CURATED_REGIONAL_OPT_IN_SOURCES = ['Guardian Pacific'];",
     'export const FEEDS = {};',
     'export const FRONTLINE_EUROPE_PROTECTED_SOURCES = [];',
     'export const INTEL_SOURCES = [];',
@@ -446,6 +447,36 @@ async function runHarness(
 }
 
 describe('cloud preference write serialization', () => {
+  it('normalizes legacy webcam data on upload without changing other preferences', async () => {
+    const result = await runHarness(async (cloudPrefs) => {
+      localStorage.setItem('wm-pinned-webcams', '[null,{}]');
+      localStorage.setItem('wm-market-watchlist-v1', 'unchanged');
+      await cloudPrefs.syncNow();
+    });
+    assert.equal(result.acceptedDataByToken['test-token']['wm-pinned-webcams'], '[]');
+    assert.equal(result.acceptedDataByToken['test-token']['wm-market-watchlist-v1'], 'unchanged');
+  });
+
+  it('normalizes legacy cloud webcam data before restoring local storage', async () => {
+    await runHarness(async (cloudPrefs, controls) => {
+      controls.seedRow('test-token', { 'wm-pinned-webcams': '[null,{}]', 'wm-market-watchlist-v1': 'unchanged' }, 1);
+      await cloudPrefs.onSignIn('user-1', 'full');
+      assert.equal(localStorage.getItem('wm-pinned-webcams'), '[]');
+      assert.equal(localStorage.getItem('wm-market-watchlist-v1'), 'unchanged');
+    });
+  });
+
+  it('normalizes a legacy webcam blob carried through a conflict retry', async () => {
+    const result = await runHarness(async (cloudPrefs, controls) => {
+      controls.seedRow('test-token', { 'wm-pinned-webcams': '[null,{}]', 'wm-market-watchlist-v1': 'unchanged' }, 10);
+      await cloudPrefs.syncNow();
+      assert.equal(localStorage.getItem('wm-pinned-webcams'), '[]');
+    });
+    assert.equal(result.conflictCount, 1);
+    assert.equal(result.acceptedDataByToken['test-token']['wm-pinned-webcams'], '[]');
+    assert.equal(result.acceptedDataByToken['test-token']['wm-market-watchlist-v1'], 'unchanged');
+  });
+
   it('coalesces overlapping uploads instead of racing stale sync versions', async () => {
     const result = await runHarness(async (cloudPrefs) => {
       await Promise.all(Array.from({ length: 6 }, () => cloudPrefs.syncNow()));
@@ -506,13 +537,17 @@ describe('cloud preference write serialization', () => {
       await cloudPrefs.onSignIn('user-1', 'full');
       cloudPrefs.install('full');
       localStorage.setItem('wm-cloud-prefs-local-schema-version', '4');
+      localStorage.setItem('worldmonitor-disabled-feeds', '["user-choice"]');
       localStorage.setItem('wm-market-watchlist-v1', 'save-before-sign-out');
       cloudPrefs.onSignOut();
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
     });
 
-    assert.equal(result.localSchemaVersion, 8);
-    assert.deepEqual(result.acceptedSchemaVersionsByToken['test-token'], [8, 8]);
+    assert.equal(result.localSchemaVersion, 9);
+    assert.deepEqual(result.acceptedSchemaVersionsByToken['test-token'], [9, 9]);
+    const disabled = JSON.parse(result.acceptedDataByToken['test-token']['worldmonitor-disabled-feeds']) as string[];
+    assert.ok(disabled.includes('user-choice'));
+    assert.ok(disabled.includes('Guardian Pacific'));
   });
 
   it('preserves edits made for a new account while its sign-in waits in the queue', async () => {

@@ -12,6 +12,7 @@
  * Desktop guard: isDesktopRuntime() always skips sync.
  */
 
+import { PINNED_WEBCAMS_KEY, normalizePinnedWebcamsPreference, normalizeWebcamPreferences } from '../../shared/pinned-webcams';
 import {
   ACCOUNT_PROVENANCE_SYNC_KEYS,
   CLOUD_SYNC_KEYS,
@@ -26,6 +27,7 @@ import {
   CANADA_ARCTIC_OPT_IN_SOURCES,
   CANADA_DEPTH_OPT_IN_SOURCES,
   CRISIS_FLOOR_OPT_IN_SOURCES,
+  CURATED_REGIONAL_OPT_IN_SOURCES,
   FEEDS,
   FRONTLINE_EUROPE_PROTECTED_SOURCES,
   getStrategicDefaultSources,
@@ -104,7 +106,7 @@ const KEY_DIRTY_KEYS = 'wm-cloud-prefs-dirty-keys';
 // the new schema version. Defaults to 1 when missing (assumes oldest).
 const KEY_LOCAL_SCHEMA_VERSION = 'wm-cloud-prefs-local-schema-version';
 
-const CURRENT_PREFS_SCHEMA_VERSION = 8;
+const CURRENT_PREFS_SCHEMA_VERSION = 9;
 const CLOUD_PREFS_REQUEST_TIMEOUT_MS = 15_000;
 
 // Migrations live in cloud-prefs-migrations.ts to keep them testable —
@@ -139,6 +141,7 @@ const CLOUD_PREFS_REQUEST_TIMEOUT_MS = 15_000;
 // Schema 7 (#6604/#6605): add the Canada depth opt-ins the same way.
 // Schema 6 already ran; a new App.ts key alone is not enough.
 // Schema 8 (#6813-#6830): add the validated crisis-desk opt-in companions.
+// Schema 9 (#7748): keep the new curated regional desks opt-in for returners.
 let _migrations: ReturnType<typeof buildMigrations> | null = null;
 let _regionalRolloutTargets: ReturnType<typeof buildRegionalFeedRolloutMigrationTargets> | null = null;
 
@@ -179,6 +182,9 @@ function getMigrations(): ReturnType<typeof buildMigrations> {
     },
     crisisDesk: {
       optInSources: CRISIS_FLOOR_OPT_IN_SOURCES,
+    },
+    curatedRegional: {
+      optInSources: CURATED_REGIONAL_OPT_IN_SOURCES,
     },
   });
   return _migrations;
@@ -452,7 +458,8 @@ function buildCloudBlob(): Record<string, string> | null {
   for (const key of CLOUD_SYNC_KEYS) {
     const read = safeStorageGetChecked(key);
     if (!read.ok) return null;
-    if (read.value !== null) blob[key] = read.value;
+    if (read.value !== null) blob[key] = key === PINNED_WEBCAMS_KEY
+      ? normalizePinnedWebcamsPreference(read.value) : read.value;
   }
   return blob;
 }
@@ -817,7 +824,7 @@ async function postCloudPrefs(
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ variant, data, expectedSyncVersion, schemaVersion }),
+      body: JSON.stringify({ variant, data: normalizeWebcamPreferences(data), expectedSyncVersion, schemaVersion }),
       signal: AbortSignal.timeout(CLOUD_PREFS_REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
