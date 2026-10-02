@@ -54,13 +54,21 @@ describe('Dockerfile.relay — transitive-import closure', () => {
     );
   });
 
+  it('copies the PizzINT history helper required by the relay', () => {
+    assert.ok(copied.has('scripts/shared/pizzint-history.cjs'));
+  });
+
   // The BFS below seeds only from COPY'd entrypoints. notification-relay.cjs
   // is NOT COPY'd (this image's CMD is ais-relay.cjs), so nothing it requires
   // is reachable by that BFS — a COPY line added solely for the relay could be
   // deleted with this suite still green (#8414 review finding). These explicit
   // assertions are what pin those lines.
   it('pins the COPY lines added for notification-relay.cjs, which the BFS cannot reach', () => {
-    for (const required of ['scripts/shared/notification-dedup.cjs', 'scripts/shared/notify-fields.cjs']) {
+    for (const required of [
+      'scripts/shared/notification-dedup.cjs',
+      'scripts/shared/notify-fields.cjs',
+      'scripts/shared/notification-link-suppression.cjs',
+    ]) {
       assert.ok(
         copied.has(required),
         `${required} is required by scripts/notification-relay.cjs and must stay COPY'd; ` +

@@ -300,6 +300,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/aviation/v1/search-google-dates': 'medium',
   '/api/aviation/v1/list-aviation-news': 'slow',
   '/api/market/v1/get-country-stock-index': 'slow',
+  '/api/market/v1/get-price-history': 'static',
 
   '/api/natural/v1/list-natural-events': 'slow',
   '/api/wildfire/v1/list-fire-detections': 'static',
@@ -361,6 +362,15 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/economic/v1/get-crude-inventories': 'daily',
   '/api/economic/v1/get-nat-gas-storage': 'daily',
   '/api/economic/v1/get-eu-yield-curve': 'daily',
+  // Daily macro seed. A miss returns unavailable:true, which the gateway
+  // already keeps out of the shared cache.
+  '/api/economic/v1/get-us-cpi-monthly': 'daily',
+  '/api/economic/v1/get-us-treasury-par-yield-curve': 'daily',
+  '/api/economic/v1/get-us-interest-rates': 'daily',
+  '/api/economic/v1/get-world-cpi-monthly': 'daily',
+  // Daily yield-curve bundle. A miss returns unavailable:true, which the
+  // gateway already keeps out of the shared cache.
+  '/api/economic/v1/get-government-yield-curve': 'daily',
   '/api/supply-chain/v1/get-critical-minerals': 'daily',
   '/api/supply-chain/v1/get-mineral-production': 'daily',
   '/api/military/v1/get-aircraft-details': 'static',

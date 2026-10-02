@@ -2,6 +2,7 @@ import { motion } from 'motion/react';
 import { Check } from 'lucide-react';
 import { CardLinkArrow, cardLinkFocusRing } from './CardLink';
 import { t } from '../i18n';
+import depthProofStats from '../generated/depth-stats.json';
 
 // Registry install commands are product identifiers, not prose — they stay
 // untranslated on purpose (same reason the tool names below do).
@@ -15,7 +16,13 @@ const INSTALL_CHIPS = [
 const AGENT_RESOURCES = [
   { key: 'briefing', href: '/llms.txt', display: '/llms.txt', eventTarget: 'welcome-agent-briefing' },
   { key: 'mcp', href: 'https://worldmonitor.app/mcp', display: 'worldmonitor.app/mcp', eventTarget: 'welcome-agent-mcp' },
-  { key: 'api', href: 'https://api.worldmonitor.app', display: 'api.worldmonitor.app', eventTarget: 'welcome-agent-api' },
+  // Destination is the API reference, not the bare api host: that host's root
+  // is a 308 to the www homepage, so it was a redirect hop to a page that is
+  // not the API (#8603). `display` tracks the destination, as it does for
+  // every other entry here — this block is read by LLMs summarising the
+  // section, so a display string that names a different URL than the link
+  // would teach them the wrong base URL.
+  { key: 'api', href: 'https://www.worldmonitor.app/docs/api-reference', display: 'worldmonitor.app/docs/api-reference', eventTarget: 'welcome-agent-api' },
   { key: 'agentView', href: '/?mode=agent', display: '/?mode=agent', eventTarget: 'welcome-agent-view' },
 ] as const;
 
@@ -35,7 +42,7 @@ export const Agents = () => (
           {[1, 2, 3, 4].map(n => (
             <li key={n} className="flex items-start gap-2.5">
               <Check className="w-4 h-4 text-wm-green shrink-0 mt-0.5" aria-hidden="true" />
-              <span className="text-wm-muted">{t(`welcome.agents.b${n}`)}</span>
+              <span className="text-wm-muted">{t(`welcome.agents.b${n}`, depthProofStats)}</span>
             </li>
           ))}
         </ul>

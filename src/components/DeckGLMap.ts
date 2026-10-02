@@ -3,7 +3,7 @@
  * Uses deck.gl for high-performance rendering of large datasets
  * Mobile devices gracefully degrade to the D3/SVG-based Map component
  */
-import { MapboxOverlay } from '@deck.gl/mapbox';
+import { MapLibreOverlay } from '@deck.gl/maplibre';
 import type { Layer, LayersList, PickingInfo } from '@deck.gl/core';
 import { GeoJsonLayer, ScatterplotLayer, PathLayer, IconLayer, TextLayer, PolygonLayer } from '@deck.gl/layers';
 import * as maplibregl from 'maplibre-gl';
@@ -155,7 +155,13 @@ import type { KindnessPoint } from '@/services/kindness-data';
 import type { HappinessData } from '@/services/happiness-data';
 import type { RenewableInstallation } from '@/services/renewable-installations';
 import type { SpeciesRecovery } from '@/services/conservation-data';
-import { getCountriesGeoJson, getCountryAtCoordinates, getCountryBbox, getCountryCentroid } from '@/services/country-geometry';
+import {
+  canonicalizeCountryCode,
+  getCountriesGeoJson,
+  getCountryAtCoordinates,
+  getCountryBbox,
+  getCountryCentroid,
+} from '@/services/country-geometry';
 import type { DiseaseOutbreakItem } from '@/services/disease-outbreaks';
 import type { FeatureCollection, Geometry } from 'geojson';
 import type { ResilienceRankingItem } from '@/services/resilience';
@@ -217,6 +223,7 @@ interface DeckMapState {
 
 interface DeckGLMapOptions {
   chrome?: boolean;
+  mapLibreWorkerUrl?: string;
   /**
    * Fired when MapLibre cannot be (re)constructed after the initial ready
    * handshake — e.g. WebGL2 lost mid-session while recreating the fallback
@@ -525,12 +532,6 @@ function stableTradeRoutePhase(routeId: string): number {
 // or recreateWithFallback rebuilds the map.
 let __deckInterleavedRaceFilterInstalled = false;
 
-// deck.gl 9.x still reads map.transform for interleaved projection/terrain.
-// Remove this bridge when @deck.gl/mapbox supports MapLibre 6's camera API.
-class DeckCompatibleMap extends maplibregl.Map {
-  get transform() { return this._camera.transform; }
-}
-
 const DECK_INTERLEAVED_RACE_MESSAGE_RE = /Cannot read properties of null \(reading 'id'\)|null is not an object \(evaluating '[\w.]+\.id'\)/;
 const DECK_INTERLEAVED_RACE_SOURCE_RE = /(?:^|[/(])deck-stack-[A-Za-z0-9_-]+\.js/;
 
@@ -548,7 +549,7 @@ const DECK_INTERLEAVED_RACE_SOURCE_RE = /(?:^|[/(])deck-stack-[A-Za-z0-9_-]+\.js
  * custom-layer hook → deck iterates the layer list and hits a layer that was
  * finalized between resolveLayers and renderLayers.
  *
- * MapboxOverlay's own onError is bypassed because maplibre — not deck — owns
+ * MapLibreOverlay's own onError is bypassed because maplibre — not deck — owns
  * the render-loop callstack here (deck doesn't see the throw, so onError is
  * never invoked). The next frame renders cleanly with no user-visible
  * artifact, so swallowing here is safe.
@@ -587,7 +588,7 @@ export class DeckGLMap {
   private static readonly MAX_CLUSTER_LEAVES = 200;
 
   private container: HTMLElement;
-  private deckOverlay: MapboxOverlay | null = null;
+  private deckOverlay: MapLibreOverlay | null = null;
   private maplibreMap: maplibregl.Map | null = null;
   private state: DeckMapState;
   private popup: MapPopup;
@@ -630,6 +631,7 @@ export class DeckGLMap {
   private serverBases: MilitaryBaseEnriched[] = [];
   private serverBaseClusters: ServerBaseCluster[] = [];
   private serverBasesLoaded = false;
+  private serverBasesFetchSeq = 0;
   private baseConfigLoadPending = false;
   private naturalEvents: NaturalEvent[] = [];
   private firmsFireData: Array<{ lat: number; lon: number; brightness: number; frp: number; confidence: number; region: string; acq_date: string; daynight: string }> = [];
@@ -763,7 +765,12 @@ export class DeckGLMap {
     const lngLat = this.maplibreMap.unproject([x, y]);
     if (!Number.isFinite(lngLat.lng)) return;
     const country = resolveCountryForPointerInteraction(
-      { code: this.hoveredCountryIso2, name: this.hoveredCountryName },
+      {
+        code: this.hoveredCountryIso2
+          ? canonicalizeCountryCode(this.hoveredCountryIso2)
+          : this.hoveredCountryIso2,
+        name: this.hoveredCountryName,
+      },
       this.hoverQueryThrottle?.isPending() ?? false,
       () => this.resolveCountryFromCoordinate(lngLat.lng, lngLat.lat),
     );
@@ -772,7 +779,7 @@ export class DeckGLMap {
       lon: lngLat.lng,
       screenX: e.clientX,
       screenY: e.clientY,
-      countryCode: country?.code,
+      countryCode: country?.code ? canonicalizeCountryCode(country.code) : country?.code,
       countryName: country?.name,
     });
   };
@@ -811,6 +818,7 @@ export class DeckGLMap {
   private destroyed = false;
   private usedFallbackStyle = false;
   private readonly chrome: boolean;
+  private readonly mapLibreWorkerUrl: string | undefined;
   private readonly onFatalError: ((error: unknown) => void) | null;
   private initPromise: Promise<void> = Promise.resolve();
   private styleLoadTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -890,6 +898,7 @@ export class DeckGLMap {
   constructor(container: HTMLElement, initialState: DeckMapState, options: DeckGLMapOptions = {}) {
     this.container = container;
     this.chrome = options.chrome ?? true;
+    this.mapLibreWorkerUrl = options.mapLibreWorkerUrl;
     this.onFatalError = options.onFatalError ?? null;
     this.state = {
       ...initialState,
@@ -1061,7 +1070,7 @@ export class DeckGLMap {
     wrapper.id = 'deckglMapWrapper';
     wrapper.style.cssText = 'position: relative; width: 100%; height: 100%; overflow: hidden;';
 
-    // MapLibre container - deck.gl renders directly into MapLibre via MapboxOverlay
+    // MapLibre container - deck.gl renders directly into MapLibre via MapLibreOverlay
     const mapContainer = document.createElement('div');
     mapContainer.id = 'deckgl-basemap';
     mapContainer.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%;';
@@ -1090,7 +1099,7 @@ export class DeckGLMap {
   }
 
   private async initMapLibre(): Promise<void> {
-    maplibregl.setWorkerUrl(maplibreWorkerUrl);
+    maplibregl.setWorkerUrl(this.mapLibreWorkerUrl ?? maplibreWorkerUrl);
     // No `setRTLTextPlugin` here: MapLibre 6 shapes Arabic and reorders
     // bidirectional text itself and deprecates the plugin. Registering the
     // self-hosted plugin after the 6.x upgrade also broke RTL labels outright —
@@ -1114,7 +1123,7 @@ export class DeckGLMap {
     const basemapEl = document.getElementById('deckgl-basemap');
     if (!basemapEl) return;
 
-    this.maplibreMap = new DeckCompatibleMap({
+    this.maplibreMap = new maplibregl.Map({
       container: basemapEl,
       style: primaryStyle,
       center: [preset.longitude, preset.latitude],
@@ -1189,7 +1198,7 @@ export class DeckGLMap {
         return;
       }
       try {
-        this.maplibreMap = new DeckCompatibleMap({
+        this.maplibreMap = new maplibregl.Map({
           container: fallbackEl,
           style: fallback,
           center: center ? [center.lon, center.lat] : [preset.longitude, preset.latitude],
@@ -1303,7 +1312,7 @@ export class DeckGLMap {
 
     installDeckInterleavedRaceFilter();
 
-    this.deckOverlay = new MapboxOverlay({
+    this.deckOverlay = new MapLibreOverlay({
       interleaved: true,
       layers: this.buildLayers(true),
       getTooltip: (info: PickingInfo) => this.getTooltip(info),
@@ -2384,7 +2393,7 @@ export class DeckGLMap {
         getFillColor: (d) => ('count' in d ? [0, 212, 255, 180] : [255, 215, 0, 200]) as [number, number, number, number],
         radiusUnits: 'pixels',
         pickable: true,
-        // Consume the pick (return true) so MapboxOverlay onClick → handleClick
+        // Consume the pick (return true) so MapLibreOverlay onClick → handleClick
         // does not double-fire. Cluster vs leaf is routed in handleWebcamLayerClick.
         onClick: (info) => this.handleWebcamLayerClick(info),
       }));
@@ -5070,7 +5079,7 @@ export class DeckGLMap {
         const item = (obj as { item: DiseaseOutbreakItem }).item;
         if (!item) return null;
         const lvlColor = item.alertLevel === 'alert' ? '#e74c3c' : item.alertLevel === 'warning' ? '#e67e22' : '#f1c40f';
-        const casesHtml = item.cases ? ` | ${item.cases} case${item.cases !== 1 ? 's' : ''}` : '';
+        const casesHtml = item.cases ? ` | ${text(item.cases)} case${item.cases !== 1 ? 's' : ''}` : '';
         const dateStr = new Date(item.publishedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
         const metaHtml = `<br/><span style="opacity:.6;font-size:calc(11px * var(--wm-panel-effective-scale, 1))">${text(item.sourceName || '')} | ${dateStr}${casesHtml}</span>`;
         const summaryHtml = item.summary ? `<br/><span style="opacity:.75">${text(item.summary.slice(0, 100))}${item.summary.length > 100 ? '…' : ''}</span>` : '';
@@ -5268,17 +5277,31 @@ export class DeckGLMap {
         const [lon, lat] = info.coordinate as [number, number];
         let country: { code: string; name: string } | null = null;
         if (isChoropleth && info.object?.properties) {
-          country = { code: info.object.properties['ISO3166-1-Alpha-2'] as string, name: info.object.properties.name as string };
+          const rawCode = info.object.properties['ISO3166-1-Alpha-2'] as string;
+          country = {
+            code: typeof rawCode === 'string' ? canonicalizeCountryCode(rawCode) : '',
+            name: info.object.properties.name as string,
+          };
         } else {
           country = resolveCountryForPointerInteraction(
-            { code: this.hoveredCountryIso2, name: this.hoveredCountryName },
+            {
+              code: this.hoveredCountryIso2
+                ? canonicalizeCountryCode(this.hoveredCountryIso2)
+                : this.hoveredCountryIso2,
+              name: this.hoveredCountryName,
+            },
             this.hoverQueryThrottle?.isPending() ?? false,
             () => this.resolveCountryFromCoordinate(lon, lat),
           );
         }
         // Only fire if we have a country — ocean/no-country clicks are silently ignored
         if (country?.code && country?.name) {
-          this.onCountryClick({ lat, lon, code: country.code, name: country.name });
+          this.onCountryClick({
+            lat,
+            lon,
+            code: canonicalizeCountryCode(country.code),
+            name: country.name,
+          });
         }
       }
       return;
@@ -5560,7 +5583,7 @@ export class DeckGLMap {
 
   /**
    * Layer-level webcam pick. Returns true so deck.gl consumes the event and the
-   * global MapboxOverlay handler does not run a second time (#3877 / #4230).
+   * global MapLibreOverlay handler does not run a second time (#3877 / #4230).
    * Clusters zoom in instead of opening a tab per camera.
    */
   private handleWebcamLayerClick(info: PickingInfo): boolean {
@@ -5883,6 +5906,7 @@ export class DeckGLMap {
           this.state.layers[layer] = enabled;
           if (layer === 'military' && !enabled) this.clearFlightTrails();
           if (layer === 'flights') this.manageAircraftTimer(enabled);
+          if (layer === 'bases' && enabled) this.debouncedFetchBases();
           if (this.state.layers.weather && !prevRadar) this.startWeatherRadar();
           else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
           if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
@@ -6522,9 +6546,11 @@ export class DeckGLMap {
     }
     const prevRadar = this.state.layers.weather;
     const prevCyber = this.state.layers.cyberThreats;
+    const prevBases = this.state.layers.bases;
     this.state.layers = normalizeExclusiveChoropleths(next, this.state.layers);
     if (!this.state.layers.military) this.clearFlightTrails();
     this.manageAircraftTimer(this.state.layers.flights);
+    if (this.state.layers.bases && !prevBases) this.debouncedFetchBases();
     if (this.state.layers.weather && !prevRadar) this.startWeatherRadar();
     else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
     if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
@@ -7137,6 +7163,11 @@ export class DeckGLMap {
   }
 
   private fetchServerBases(): void {
+    const fetchSeq = ++this.serverBasesFetchSeq;
+    this.serverBases = [];
+    this.serverBaseClusters = [];
+    this.serverBasesLoaded = false;
+    this.render();
     if (!this.maplibreMap) return;
     const mapLayers = this.state.layers;
     if (!mapLayers.bases) return;
@@ -7146,7 +7177,15 @@ export class DeckGLMap {
     const sw = bounds.getSouthWest();
     const ne = bounds.getNorthEast();
     fetchMilitaryBases(sw.lat, sw.lng, ne.lat, ne.lng, zoom).then((result) => {
-      if (!result) return;
+      if (!result || this.destroyed || fetchSeq !== this.serverBasesFetchSeq || !this.maplibreMap || !this.state.layers.bases) return;
+      const currentBounds = this.maplibreMap.getBounds();
+      const currentSw = currentBounds.getSouthWest();
+      const currentNe = currentBounds.getNorthEast();
+      if (this.maplibreMap.getZoom() !== zoom
+        || currentSw.lat !== sw.lat || currentSw.lng !== sw.lng
+        || currentNe.lat !== ne.lat || currentNe.lng !== ne.lng) return;
+      // Empty-200 / error payloads are not loaded coverage; keep bundled fallback.
+      if (result.bases.length === 0 && result.clusters.length === 0 && result.totalInView === 0) return;
       this.serverBases = result.bases;
       this.serverBaseClusters = result.clusters;
       this.serverBasesLoaded = true;
@@ -7709,6 +7748,7 @@ export class DeckGLMap {
       if (layer === 'weather') this.startWeatherRadar();
       if (layer === 'cyberThreats' && !this.aptGroupsLoaded) this.loadAptGroups();
       if (layer === 'flights') this.manageAircraftTimer(true);
+      if (layer === 'bases') this.debouncedFetchBases();
       this.render();
       this.updateLegend();
       this.onLayerChange?.(layer, true, 'programmatic');
@@ -7743,6 +7783,7 @@ export class DeckGLMap {
     else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
     if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
     if (layer === 'flights') this.manageAircraftTimer(this.state.layers.flights);
+    if (layer === 'bases' && this.state.layers.bases) this.debouncedFetchBases();
     this.render();
     this.updateLegend();
     this.onLayerChange?.(layer, this.state.layers[layer], 'programmatic');
@@ -7949,7 +7990,7 @@ export class DeckGLMap {
       const features = this.maplibreMap.queryRenderedFeatures(point, { layers: ['country-interactive'] });
       const properties = (features?.[0]?.properties ?? {}) as Record<string, unknown>;
       const code = typeof properties['ISO3166-1-Alpha-2'] === 'string'
-        ? properties['ISO3166-1-Alpha-2'].trim().toUpperCase()
+        ? canonicalizeCountryCode(properties['ISO3166-1-Alpha-2'])
         : '';
       const name = typeof properties.name === 'string'
         ? properties.name.trim()
@@ -8079,7 +8120,10 @@ export class DeckGLMap {
         if (!map.getLayer('country-interactive')) return;
         const features = map.queryRenderedFeatures(point, { layers: ['country-interactive'] });
         const props = features?.[0]?.properties;
-        const iso2 = props?.['ISO3166-1-Alpha-2'] as string | undefined;
+        const rawIso2 = props?.['ISO3166-1-Alpha-2'] as string | undefined;
+        // Keep MapLibre filters on the feature's property value (rewritten to
+        // ISO2 on geometry load) while storing the canonical code for clicks.
+        const iso2 = typeof rawIso2 === 'string' ? canonicalizeCountryCode(rawIso2) : undefined;
         const name = props?.['name'] as string | undefined;
 
         if (iso2 && iso2 !== hoveredIso2) {
@@ -8130,11 +8174,11 @@ export class DeckGLMap {
   }
 
   public highlightCountry(code: string): void {
-    this.highlightedCountryCode = code;
+    this.highlightedCountryCode = canonicalizeCountryCode(code);
     if (!this.maplibreMap || !this.countryGeoJsonLoaded) return;
     try {
       if (!this.maplibreMap.getLayer('country-highlight-fill')) return;
-      const filter = ['==', ['get', 'ISO3166-1-Alpha-2'], code] as maplibregl.FilterSpecification;
+      const filter = ['==', ['get', 'ISO3166-1-Alpha-2'], this.highlightedCountryCode] as maplibregl.FilterSpecification;
       this.maplibreMap.setFilter('country-highlight-fill', filter);
       this.maplibreMap.setFilter('country-highlight-border', filter);
       this.pulseCountryHighlight();
