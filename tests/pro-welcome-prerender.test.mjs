@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import { latestValidGithubStarsSnapshot } from '../scripts/github-stars-snapshot.mjs';
 import { guardProBuiltOutput, shouldSkipProBuiltOutput } from './_lib/pro-built-output.mjs';
@@ -13,7 +13,7 @@ const enLocale = () =>
 const proofFacts = () =>
   JSON.parse(readFileSync(new URL('../pro-test/src/generated/depth-stats.json', import.meta.url), 'utf8'));
 const fillProofFacts = (text, facts) => text.replace(/\{\{(\w+)\}\}/g, (_, key) => String(facts[key]));
-const WELCOME_FAQ_COUNT = 11;
+const WELCOME_FAQ_COUNT = 12;
 const CANONICAL_ORIGIN = 'https://www.worldmonitor.app/';
 
 let cachedJsonLdBlocks;
@@ -27,6 +27,54 @@ const welcomeJsonLdBlocks = () =>
 // checkout has not built it; fail when WM_EXPECT_BUILT_OUTPUT=1 says CI did.
 const skip = shouldSkipProBuiltOutput();
 guardProBuiltOutput();
+
+// Index scanners rather than regex replacement for reading section text. The
+// input is our own build output, but a single-pass `.replace` can leave a
+// partial tag behind (CodeQL js/incomplete-multi-character-sanitization) and a
+// case-sensitive `<script` pattern misses `<SCRIPT>` (js/bad-tag-filter).
+
+// Drop every <script>/<style> element (any case, closing tag may carry
+// whitespace or attributes). An unterminated element drops the rest.
+function withoutElements(html, tagNames) {
+  const lower = html.toLowerCase();
+  let out = '';
+  let i = 0;
+  while (i < html.length) {
+    const lt = lower.indexOf('<', i);
+    if (lt === -1) return out + html.slice(i);
+    const name = tagNames.find((tag) => lower.startsWith(tag, lt + 1));
+    if (!name) {
+      out += html.slice(i, lt + 1);
+      i = lt + 1;
+      continue;
+    }
+    out += html.slice(i, lt);
+    const close = lower.indexOf(`</${name}`, lt + 1);
+    const end = close === -1 ? -1 : lower.indexOf('>', close);
+    if (end === -1) return out;
+    i = end + 1;
+  }
+  return out;
+}
+
+// Replace each `<...>` tag with `separator`, keeping text between tags. A `<`
+// with no later `>` (or an empty `<>`) stays literal, as with /<[^>]+>/g.
+function tagsToText(html, separator) {
+  let out = '';
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    const gt = lt === -1 ? -1 : html.indexOf('>', lt + 1);
+    if (lt === -1 || gt === -1) return out + html.slice(i);
+    if (gt === lt + 1) {
+      out += html.slice(i, gt + 1);
+    } else {
+      out += html.slice(i, lt) + separator;
+    }
+    i = gt + 1;
+  }
+  return out;
+}
 
 const welcomeRoot = () => {
   const rootMatch = welcomeHtml().match(/<div id="root"(?<attrs>[^>]*)>(?<content>[\s\S]*?)<\/body>/);
@@ -55,6 +103,12 @@ test('welcome FAQPage JSON-LD matches every visible FAQ entry', { skip }, () => 
   // The structured answer to the Liveuamap question must carry the compare
   // destination itself, not only the DOM anchor derived from it (#7746).
   assert.match(faqPage.mainEntity[4].acceptedAnswer.text, /worldmonitor\.app\/compare\/liveuamap-alternatives/);
+  // The software-choice question opens with the answer and its measured
+  // inventory, so an answer engine can quote the first sentence alone.
+  const softwareAnswer = faqPage.mainEntity[11];
+  assert.equal(softwareAnswer.name, 'What is the best software for tracking global news disruptions?');
+  assert.match(softwareAnswer.acceptedAnswer.text, new RegExp(`^World Monitor is a free, open-source option: it streams ${facts.feeds} news and OSINT feeds from ${facts.providers} attributed providers onto one live world map with ${facts.mapLayers} map layer types`));
+  assert.match(softwareAnswer.acceptedAnswer.text, /worldmonitor\.app\/compare\/best-geopolitical-risk-dashboards\.$/);
 });
 
 // AI answers quote one passage, not the stat rail beside it, so each
@@ -70,8 +124,81 @@ test('question-headed welcome passages state their own measured figures', { skip
   const whatIs = passageAfter('What is World Monitor?');
   assert.match(whatIs, new RegExp(`${facts.feeds} news and OSINT feeds from ${facts.providers} attributed providers`));
   assert.match(whatIs, new RegExp(`${facts.mapLayers} map layer types`));
-  assert.match(passageAfter('How do I start watching the world map?'), new RegExp(`free, no account, ${facts.mapLayers} map layer types ready to switch on`));
+  // Resilience is Pro-locked, so the free-start answer must not promise every counted layer.
+  assert.match(passageAfter('How do I start watching the world map?'), new RegExp(`${facts.mapLayers} map layer types, every one except Resilience free to switch on`));
+  assert.match(passageAfter('How do I build on World Monitor from my own stack?'), new RegExp(`${facts.mcpTools} live tools`));
   assert.match(content, new RegExp(`${facts.mcpTools} MCP tools`));
+});
+
+// geo.new scores a plain count 0 on statistics and a block under ~40 words 60
+// on self-containment, so these two first-five cards carry a percentage or the
+// length that earns those dimensions. The figures come from copy-stats.json.
+test('first-five probe cards state measured figures at citation length', { skip }, () => {
+  const facts = proofFacts();
+  const copy = JSON.parse(readFileSync(new URL('../pro-test/src/generated/copy-stats.json', import.meta.url), 'utf8'));
+  const { content } = welcomeRoot();
+  const cardText = (heading) => {
+    const at = content.indexOf(`>${heading}</h3>`);
+    assert.ok(at >= 0, `missing card: ${heading}`);
+    return tagsToText(content.slice(at).match(/<p[^>]*>([\s\S]*?)<\/p>/)?.[1] ?? '', '').replace(/&#x27;/g, "'");
+  };
+  const tenth = cardText('You&#x27;ve seen maybe a tenth of it');
+  assert.match(tenth, new RegExp(`^When the map opens on desktop, ${copy.defaultOnLayers} of its ${facts.mapLayers} map layer types, about ${copy.defaultOnLayerPct}%, are switched on\\.`));
+  const country = cardText('Click any country');
+  for (const [name, text] of [['tenth', tenth], ['country', country]]) {
+    assert.ok(text.split(/\s+/).length >= 40, `${name} card is under 40 words: ${text}`);
+  }
+});
+
+// geo.new credits only prices, percentages and dates on statistics, so each of
+// these sections carries a real one: the $0 plan, the generated Pro price, and
+// the GPS thresholds at 40+ words.
+test('sections state a price or percentage the audit credits', { skip }, () => {
+  const copy = JSON.parse(readFileSync(new URL('../pro-test/src/generated/copy-stats.json', import.meta.url), 'utf8'));
+  const { content } = welcomeRoot();
+  const passageAfter = (heading) => {
+    const at = content.indexOf(`>${heading}</h`);
+    assert.ok(at >= 0, `missing heading: ${heading}`);
+    return tagsToText(content.slice(at).match(/<p[^>]*>([\s\S]*?)<\/p>/)?.[1] ?? '', '');
+  };
+  assert.match(passageAfter('What is World Monitor?'), /^World Monitor is a free \(\$0\), open-source/);
+  assert.match(passageAfter('How do I start watching the world map?'), /in any browser for \$0, with no account/);
+  const build = passageAfter('How do I build on World Monitor from my own stack?');
+  assert.ok(build.includes(`MCP access comes with Pro, from $${copy.proMonthlyPrice}/mo.`), build);
+  const gps = passageAfter('GPS jamming zones');
+  assert.match(gps, /at least 2% of aircraft/);
+  assert.ok(gps.split(/\s+/).length >= 40, `GPS card is under 40 words: ${gps}`);
+});
+
+// The FAQ figures live inside <details> answers, which geo.new did not credit
+// to the heading (the FAQ scored weakest, 37/100, though its first answer
+// opens with $0). The heading therefore needs its own paragraph, directly
+// under the <h2> and before the first <details>.
+test('FAQ heading carries its own figure paragraph before the answers', { skip }, () => {
+  const { content } = welcomeRoot();
+  const at = content.indexOf('>What are common questions about World Monitor?</h2>');
+  assert.ok(at >= 0, 'missing FAQ heading');
+  const beforeAnswers = content.slice(at, content.indexOf('<details', at));
+  const subtitle = tagsToText(beforeAnswers.match(/<p[^>]*>([\s\S]*?)<\/p>/)?.[1] ?? '', '');
+  assert.match(subtitle, new RegExp(`^${WELCOME_FAQ_COUNT} straight answers on price, data, alerts and AI access\\.`));
+  assert.match(subtitle, /costs \$0/);
+  assert.match(subtitle, /AGPL-3\.0/);
+});
+
+// The geo.new CIT-02/03 audit judges each H2 section by its opening, roughly
+// the first 60 words, so a figure buried in the fifth FAQ answer does not
+// count. Every H2 section, the noscript fallback included, must open with one.
+test('every H2 section states a figure within its first 60 words', { skip }, () => {
+  const facts = proofFacts();
+  const html = withoutElements(welcomeHtml(), ['script', 'style']);
+  const parts = html.split(/<h2[^>]*>([\s\S]*?)<\/h2>/);
+  assert.ok(parts.length > 20, 'expected the welcome page H2 sections');
+  for (let i = 1; i < parts.length; i += 2) {
+    const heading = tagsToText(parts[i], '').trim();
+    const opening = tagsToText(parts[i + 1], ' ').split(/\s+/).filter(Boolean).slice(0, 60).join(' ');
+    assert.match(opening, /\d/, `"${heading}" opens without a figure: ${opening}`);
+  }
+  assert.match(welcomeHtml(), new RegExp(`${facts.feeds} news and OSINT feeds — onto one live map with ${facts.mapLayers} map layer types`));
 });
 
 test('welcome JSON-LD connects the page, website, application, and publisher', { skip }, () => {
@@ -109,6 +236,11 @@ test('built welcome page ships the real hero in #root before JavaScript', { skip
   assert.doesNotMatch(rootContent, /id="seo-prerender"/);
   assert.equal([...rootContent.matchAll(/<h1\b/g)].length, 1);
   assert.match(rootContent, /<nav[\s>]/);
+  assert.match(
+    rootContent,
+    /<h1\b[^>]*>[\s\S]*Real-time geopolitical[\s\S]*intelligence dashboard[\s\S]*<\/h1>/,
+    'welcome H1 should name the product',
+  );
   assert.match(rootContent, /By the time it&#x27;s news,[\s\S]*you already knew\./);
   assert.match(rootContent, /Launch the dashboard/);
   assert.match(rootContent, /Open source · AGPL-3\.0/);
@@ -124,6 +256,8 @@ test('built welcome page ships the real hero in #root before JavaScript', { skip
   const faqContent = rootContent.slice(faqStart);
   assert.match(faqContent, /href="\/compare\/best-geopolitical-risk-dashboards\/"[^>]*>worldmonitor\.app\/compare\/best-geopolitical-risk-dashboards<\/a>/);
   assert.match(faqContent, /href="\/compare\/liveuamap-alternatives\/"[^>]*>worldmonitor\.app\/compare\/liveuamap-alternatives<\/a>/);
+  // a5 and a12 both link the dashboard comparison.
+  assert.equal(faqContent.match(/href="\/compare\/best-geopolitical-risk-dashboards\/"[^>]*>worldmonitor\.app\/compare\/best-geopolitical-risk-dashboards<\/a>/g)?.length, 2);
   // Untagged since #8603: middleware 308s utm_* away, so every one of these
   // was a redirect hop. Each link is still identified individually, by the
   // Umami target or link text that replaced its utm tag as the attribution.
@@ -141,11 +275,69 @@ test('built welcome page ships the real hero in #root before JavaScript', { skip
   assert.match(navContent, /href="\/sources\/"[^>]*>Attributed providers<\/a>/);
   assert.match(navContent, /id="welcome-tablet-navigation"/);
   assert.match(navContent, />Menu</);
-  const headlineIndex = rootContent.indexOf('By the time it&#x27;s news,');
-  assert.ok(headlineIndex > 0, 'welcome headline should be in the prerendered root');
+  const headlineIndex = rootContent.indexOf('Real-time geopolitical');
+  assert.ok(headlineIndex > 0, 'welcome H1 should name the product');
   const heroSection = rootContent.slice(0, rootContent.indexOf('<section class="py-16'));
   assert.doesNotMatch(heroSection, /opacity:0/);
   assert.match(rootContent, /<img[^>]+src="\/pro\/assets\/worldmonitor-7-mar-2026-[^"]+\.jpg"[^>]+fetchPriority="high"/);
+});
+
+// React skips the image preload for an <img> inside <picture>, so without the
+// prerender's head tag the LCP hero waits for the body parser to reach it.
+test('built welcome head preloads the hero AVIF srcset the <picture> serves', { skip }, () => {
+  const html = welcomeHtml();
+  const head = html.slice(0, html.indexOf('</head>'));
+  // Desktop only: on phones the <h1> is the LCP and the screenshot is far below the fold.
+  const preload = head.match(/<link rel="preload" as="image" type="image\/avif" media="\(min-width: 640px\)" imagesrcset="([^"]+)" imagesizes="([^"]+)" fetchpriority="high">/);
+  assert.ok(preload, 'welcome <head> should preload the hero AVIF');
+  const source = welcomeRoot().content.match(/<picture><source type="image\/avif" srcSet="([^"]+)" sizes="([^"]+)"\/>/);
+  assert.ok(source, 'hero <picture> should carry an AVIF <source>');
+  assert.equal(preload[1], source[1], 'preload imagesrcset must match the rendered <source>');
+  assert.equal(preload[2], source[2], 'preload imagesizes must match the rendered <source>');
+});
+
+// Mobile audits fail any rendered text under 12px (0.75rem at the 16px root).
+const fontSizesBelow12px = (css) =>
+  [...css.matchAll(/font-size:\s*(\d*\.?\d+)(px|rem)/g)]
+    .map(([declaration, value, unit]) => ({ declaration, px: Number(value) * (unit === 'rem' ? 16 : 1) }))
+    .filter(({ px }) => px < 12)
+    .map(({ declaration }) => declaration);
+const SUB_12PX_TEXT_UTILITY = /\btext-\[(?:(?:\d|1[01])(?:\.\d+)?px|0?\.(?:[0-6]\d*|7(?:[0-4]\d*)?)rem)\]/;
+
+// The inline critical CSS is what audits read first, and it mirrors every size
+// the prerendered hero uses — on / (welcome.html) and, since #9175, /pro too.
+test('built welcome and /pro pages set no font size below 12px', { skip }, () => {
+  const proHtml = readFileSync(new URL('../public/pro/index.html', import.meta.url), 'utf8');
+  assert.deepEqual(fontSizesBelow12px(welcomeHtml()), [], 'welcome.html');
+  assert.deepEqual(fontSizesBelow12px(proHtml), [], 'index.html');
+  assert.doesNotMatch(welcomeRoot().content, SUB_12PX_TEXT_UTILITY);
+});
+
+// Source-level twin of the built check, so it runs without a build and covers
+// components the welcome prerender never renders (/pro, pricing, checkout).
+test('pro-test source uses no text utility or font-size below 12px', () => {
+  const srcRoot = new URL('../pro-test/src/', import.meta.url);
+  const offenders = readdirSync(srcRoot, { recursive: true })
+    .filter((path) => /\.(?:tsx?|css)$/.test(path))
+    .flatMap((path) => {
+      const source = readFileSync(new URL(path, srcRoot), 'utf8');
+      return [
+        ...(source.match(new RegExp(SUB_12PX_TEXT_UTILITY.source, 'g')) ?? []),
+        ...fontSizesBelow12px(source),
+      ].map((hit) => `${path}: ${hit}`);
+    });
+  assert.deepEqual(offenders, []);
+});
+
+// The JSON-LD `author` (#7459a) must name someone the page visibly credits, or
+// structured-data audits flag it as schema/content drift.
+test('welcome JSON-LD author is visibly credited in the rendered page', { skip }, () => {
+  const application = welcomeJsonLdBlocks().find((block) => block['@type'] === 'SoftwareApplication');
+  assert.equal(application.author?.['@id'], `${CANONICAL_ORIGIN}blog/authors/elie-habib/#person`);
+  assert.match(
+    welcomeRoot().content,
+    new RegExp(`<a href="${CANONICAL_ORIGIN}blog/authors/elie-habib/"[^>]*>${application.author.name}</a>`),
+  );
 });
 
 test('built welcome root hides no SSR content and links every primary reference page', { skip }, () => {
@@ -183,7 +375,7 @@ test('built welcome root hides no SSR content and links every primary reference 
 
 test('built welcome page prerenders task routes and agent discovery links', { skip }, () => {
   const { content: rootContent } = welcomeRoot();
-  const heroIndex = rootContent.indexOf('By the time it&#x27;s news,');
+  const heroIndex = rootContent.indexOf('Real-time geopolitical');
   const taskIndex = rootContent.indexOf('What are you trying to find out?');
   // Keep in sync with welcome.live.title in pro-test/src/locales/en.json (#7381).
   const liveIndex = rootContent.indexOf('What live data is this page showing right now?');
@@ -307,6 +499,18 @@ test('homepage answers "What is World Monitor?" and carries page date metadata',
   assert.ok(heading, 'homepage must define World Monitor under an answer-style H2');
   const words = heading[1].replace(/<[^>]+>/g, '').trim().split(/\s+/).length;
   assert.ok(words >= 40 && words <= 60, `definition must be 40-60 words, got ${words}`);
+  // The audience line Elie approved sits in its own paragraph, so it never
+  // counts against the 40-60 word definition budget.
+  assert.match(
+    html,
+    /<h2[^>]*>What is World Monitor\?<\/h2>\s*<p[^>]*>[\s\S]*?<\/p>\s*<p[^>]*>Best for analysts, journalists, traders and builders who need live geopolitical signals\.<\/p>/,
+    'the "Best for" line must follow the definition',
+  );
+  assert.match(
+    html,
+    /<h2[^>]*>What is World Monitor\?<\/h2>\s*<p class="welcome-seo-summary[^"]*">World Monitor is a free/,
+    'speakable .welcome-seo-summary must select the definition paragraph',
+  );
   assert.match(html, /<meta name="lastmod" content="\d{4}-\d{2}-\d{2}"\s*\/>/);
 });
 
@@ -328,4 +532,15 @@ test('built welcome lastmod tracks the teaser strip snapshot (#7654)', { skip },
     new RegExp(`<meta name="lastmod" content="${teasers.capturedAt}"`),
     'served homepage lastmod must be the snapshot capture date behind the strip',
   );
+});
+
+test('built homepage markdown twin states each hero line once', { skip }, () => {
+  const markdown = readFileSync(new URL('../public/pro/home.md', import.meta.url), 'utf8');
+  const { sub, whatIsBestFor } = enLocale().welcome.hero;
+  // The twin is the rendered page plus the curated public/home.md, and both
+  // carry the slogan and the audience line; the splice must keep only one.
+  for (const line of [sub, whatIsBestFor]) {
+    const count = markdown.split('\n').filter((row) => row.trim() === line).length;
+    assert.equal(count, 1, `public/pro/home.md must state "${line}" exactly once, found ${count}`);
+  }
 });

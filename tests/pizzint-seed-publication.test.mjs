@@ -9,6 +9,7 @@ const envelopeWriter = relay.slice(relay.indexOf('function buildEnvelope('), rel
 const envelopeReader = relay.slice(relay.indexOf('async function envelopeRead('), relay.indexOf('function notifySimpleHash('));
 const producer = relay.slice(relay.indexOf('const PIZZINT_SEED_INTERVAL_MS'), relay.indexOf('function startPizzintSeedLoop()'));
 const history = await import('../scripts/shared/pizzint-history.cjs');
+const { pizzintVenuePoint } = await import('../scripts/shared/pizzint-location.cjs');
 const emptyResponse = {
   success: true, data: [], events: [], overall_index: 0, defcon_level: 5,
   active_spikes: 0, has_active_spikes: false, timestamp: '2026-09-25T12:09:33.653Z',
@@ -30,6 +31,7 @@ function harness() {
   const context = vm.createContext({
     Date: Clock, AbortSignal: { timeout: (ms) => { state.timeouts.push(ms); return AbortSignal.timeout(ms); } }, CHROME_UA: 'test', console: { log: (...args) => state.logs.push(args), warn: (...args) => state.warnings.push(args) },
     process: { env: state.env },
+    pizzintVenuePoint,
     upstashGet: async (key) => {
       const cached = state.cache.get(key);
       return cached && cached.expiresAt > state.now ? structuredClone(cached.data) : null;
@@ -69,6 +71,17 @@ test('archives the normalized poll through the real helper', async () => {
   assert.equal(state.historyCalls.length, 1);
   assert.equal(state.historyCalls[0].provider, 'pizzint');
   assert.equal(state.historyCalls[0].locations[0].placeId, 'test-location');
+});
+
+test('publishes each venue at the pin in its Google Maps address', async () => {
+  const { state, seed } = harness();
+  state.source = { success: true, data: [{
+    ...validResponse.data[0],
+    address: 'https://www.google.com/maps/place/Extreme+Pizza/@38.8602396,-77.0585603,17z/data=!8m2!3d38.8602396!4d-77.0559854',
+  }] };
+  await seed();
+  const [venue] = state.historyCalls[0].locations;
+  assert.deepEqual({ lat: venue.lat, lng: venue.lng }, { lat: 38.8602396, lng: -77.0559854 });
 });
 
 test('an archive failure logs a fixed category and does not block publication', async () => {
@@ -386,6 +399,93 @@ async function besttimeHarness(readings) {
   readings.forEach(([live, forecast], i) => run.state.besttime.set(ids[i], liveReading(live, forecast)));
   return { ...run, ids, status: () => run.state.cache.get(payloadKey).data.data.pizzint };
 }
+
+test('a nonempty PizzINT response with null readings recovers through live BestTime data', async () => {
+  const run = await besttimeHarness([[5, 35], [15, 30], [20, 50]]);
+  run.state.source = { success: true, data: Array.from({ length: 6 }, (_, i) => ({
+    ...validResponse.data[0], place_id: `missing-${i}`, current_popularity: null,
+    percentage_of_usual: null, recorded_at: new Date(run.state.now).toISOString(),
+  })) };
+  run.state.now += 25 * 60 * 60_000;
+  await run.seed();
+  assert.equal(run.state.besttimeCalls.length, 12, 'missing primary values must not suppress the configured fallback');
+  const status = run.status();
+  assert.deepEqual(status.locations.slice(0, 3).map(l => l.currentPopularity), [5, 15, 20]);
+  assert.equal(status.locationsOpen, 3);
+  assert.equal(run.state.cache.get(metaKey).data.recordCount, 3);
+  assert.equal(run.state.cache.get(metaKey).data.lastLiveAt, run.state.now);
+  assert.equal(classifyPizzint(run.state).status, 'OK');
+});
+
+test('missing primary values and failed fallback preserve the expired live observation and metadata', async () => {
+  const run = await besttimeHarness([[5, 35]]);
+  await run.seed();
+  const previous = structuredClone(run.state.cache);
+  run.state.source = { success: true, data: [{ ...validResponse.data[0], current_popularity: null }] };
+  for (const id of run.ids) run.state.besttime.set(id, { ok: false, status: 503 });
+  run.state.now += 25 * 60 * 60_000;
+  await run.seed();
+  assert.equal(run.state.besttimeCalls.length, 18);
+  assert.deepEqual(run.state.cache, previous);
+  assert.equal(classifyPizzint(run.state).status, 'STALE_SEED');
+});
+
+for (const withMissingFreshRow of [false, true]) {
+  test(`stale primary readings${withMissingFreshRow ? ' beside a fresh no-signal row' : ''} do not suppress live fallback`, async () => {
+    const run = await besttimeHarness([[40, 45]]);
+    const stale = { ...validResponse.data[0], data_freshness: 'stale',
+      recorded_at: new Date(run.state.now - 90 * 60_000).toISOString() };
+    run.state.source = { success: true, data: [stale, ...(withMissingFreshRow ? [{
+      ...validResponse.data[0], place_id: 'no-signal', current_popularity: 0,
+      percentage_of_usual: 0, data_source: 'none',
+    }] : [])] };
+    await run.seed();
+    assert.equal(run.state.besttimeCalls.length, 12);
+    assert.equal(run.state.cache.get(payloadKey).data._seed.sourceVersion, 'besttime-live');
+    assert.equal(run.status().locations[0].currentPopularity, 40);
+    assert.equal(run.status().locations[0].noLiveSignal, false);
+    assert.equal(run.state.cache.get(metaKey).data.lastLiveAt, run.state.now);
+  });
+}
+
+test('failed fallback beside stale primary data does not renew the live clock', async () => {
+  const run = await besttimeHarness([[40, 45]]);
+  await run.seed();
+  const lastLiveAt = run.state.cache.get(metaKey).data.lastLiveAt;
+  run.state.now += 60 * 60_000;
+  run.state.source = { success: true, data: [{ ...validResponse.data[0], data_freshness: 'stale' }] };
+  for (const id of run.ids) run.state.besttime.set(id, { ok: false, status: 503 });
+  await run.seed();
+  assert.equal(run.state.besttimeCalls.length, 18);
+  assert.equal(run.state.cache.get(metaKey).data.lastLiveAt, lastLiveAt);
+  assert.equal(run.status().locations[0].dataFreshness, 'DATA_FRESHNESS_STALE');
+});
+
+test('a valid primary reading beside a null reading does not poll BestTime', async () => {
+  const run = harness();
+  run.state.source = { success: true, data: [validResponse.data[0], {
+    ...validResponse.data[0], place_id: 'missing-reading', current_popularity: null,
+  }] };
+  run.state.env.BESTTIME_API_KEY_PRIVATE = BESTTIME_KEY;
+  await run.seed();
+  assert.equal(run.state.besttimeCalls.length, 0);
+  const locations = run.state.cache.get(payloadKey).data.data.pizzint.locations;
+  assert.equal(locations[0].currentPopularity, 75);
+  assert.equal(locations[0].dataSource, '');
+  assert.equal(locations[1].noLiveSignal, true);
+});
+
+test('fresh primary readings retain priority beside stale rows, including closed zero readings', async () => {
+  for (const reading of [validResponse.data[0], { ...validResponse.data[0], current_popularity: 0, is_closed_now: true }]) {
+    const run = harness();
+    run.state.env.BESTTIME_API_KEY_PRIVATE = BESTTIME_KEY;
+    run.state.source = { success: true, data: [reading, { ...validResponse.data[0],
+      place_id: 'stale', data_freshness: 'stale' }] };
+    await run.seed();
+    assert.equal(run.state.besttimeCalls.length, 0);
+    assert.equal(run.state.cache.get(payloadKey).data._seed.sourceVersion, 'pizzint');
+  }
+});
 
 test('normal Sunday lunch publishes DEFCON 5 even when a venue is 100% busy', async () => {
   const run = await besttimeHarness([[50, 45], [40, 40], [30, 35], [100, 100]]);

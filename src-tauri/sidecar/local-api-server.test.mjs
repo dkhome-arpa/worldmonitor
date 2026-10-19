@@ -141,6 +141,168 @@ test('routes seed-only displacement requests to cloud before a local empty 200',
   }
 });
 
+for (const failure of ['silent', 'trickle', 'refused']) {
+  test(`cloud-preferred requests use local fallback when cloud is ${failure}`, async () => {
+    const endpoint = '/api/displacement/v1/get-displacement-summary';
+    const hits = [];
+    const timers = new Set();
+    const remote = createServer((req, res) => {
+      hits.push(req.url);
+      if (failure === 'trickle') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{');
+        const timer = setInterval(() => res.write(' '), 50);
+        timers.add(timer);
+        res.once('close', () => { clearInterval(timer); timers.delete(timer); });
+      }
+    });
+    const remotePort = await listen(remote);
+    if (failure === 'refused') await new Promise(resolve => remote.close(resolve));
+    const localApi = await setupApiDir({
+      'displacement/v1/get-displacement-summary.js': `export default async function handler(req) {
+        return Response.json({ source: 'local-empty', dataAvailable: false, body: await req.json() });
+      }`,
+    });
+    const app = await createLocalApiServer({
+      port: 0, apiDir: localApi.apiDir,
+      remoteBase: `http://127.0.0.1:${remotePort}`, cloudFallback: 'true', allowPrivateRemoteBase: true,
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const { port } = await app.start();
+    let deadline;
+    try {
+      const response = await Promise.race([
+        authFetch(`http://127.0.0.1:${port}${endpoint}`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"year":2025}',
+        }),
+        new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error('cloud attempt did not reach local fallback within 4s')), 4000);
+        }),
+      ]);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { source: 'local-empty', dataAvailable: false, body: { year: 2025 } });
+      assert.deepEqual(hits, failure === 'refused' ? [] : [endpoint]);
+    } finally {
+      clearTimeout(deadline);
+      for (const timer of timers) clearInterval(timer);
+      remote.closeAllConnections();
+      if (remote.listening) await new Promise(resolve => remote.close(resolve));
+      await app.close();
+      await localApi.cleanup();
+    }
+  });
+}
+
+for (const allowPrivateRemoteBase of [false, true]) {
+  test(`cloud proxy preserves its configured base and SSRF guard with private opt-in ${allowPrivateRemoteBase}`, async () => {
+    const remote = await setupRemoteServer();
+    const localApi = await setupApiDir({
+      'displacement/v1/get-displacement-summary.js': 'export default () => Response.json({ source: "local-empty" });',
+    });
+    const app = await createLocalApiServer({
+      port: 0, apiDir: localApi.apiDir, remoteBase: `${remote.remoteBase}/cloud-prefix`,
+      cloudFallback: 'true', allowPrivateRemoteBase,
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const { port } = await app.start();
+    try {
+      const endpoint = '/api/displacement/v1/get-displacement-summary';
+      const response = await authFetch(`http://127.0.0.1:${port}${endpoint}?url=http://169.254.169.254/secret`);
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.source, allowPrivateRemoteBase ? 'remote' : 'local-empty');
+      assert.deepEqual(remote.hits, allowPrivateRemoteBase ? [`/cloud-prefix${endpoint}`] : []);
+    } finally {
+      await app.close();
+      await localApi.cleanup();
+      await remote.close();
+    }
+  });
+}
+
+for (const localFailure of ['missing', 'error-response', 'throw']) {
+  test(`does not retry a timed-out cloud-preferred POST when the local handler is ${localFailure}`, async () => {
+    const endpoint = '/api/v2/shipping/webhooks';
+    let cloudCalls = 0;
+    const remote = createServer(() => { cloudCalls++; });
+    const remotePort = await listen(remote);
+    const handlers = {
+      'error-response': 'export default () => Response.json({ error: "unavailable" }, { status: 503 });',
+      throw: 'export default () => { throw new Error("local unavailable"); };',
+    };
+    const localApi = await setupApiDir(localFailure === 'missing' ? {} : {
+      'v2/shipping/webhooks.js': handlers[localFailure],
+    });
+    const app = await createLocalApiServer({
+      port: 0, apiDir: localApi.apiDir,
+      remoteBase: `http://127.0.0.1:${remotePort}`, cloudFallback: 'true', allowPrivateRemoteBase: true,
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const { port } = await app.start();
+    let deadline;
+    try {
+      const response = await Promise.race([
+        authFetch(`http://127.0.0.1:${port}${endpoint}`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"url":"https://example.com/hook"}',
+        }),
+        new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error('cloud-preferred POST was retried after its deadline')), 4000);
+        }),
+      ]);
+      assert.equal(response.status, { missing: 404, 'error-response': 503, throw: 502 }[localFailure]);
+      assert.equal(cloudCalls, 1, 'a POST may already have applied its side effect before the cloud response stalls');
+    } finally {
+      clearTimeout(deadline);
+      remote.closeAllConnections();
+      await new Promise(resolve => remote.close(resolve));
+      await app.close();
+      await localApi.cleanup();
+    }
+  });
+}
+
+test('cloud proxy cancels its upstream request when the desktop client disconnects', async () => {
+  let cloudRequest;
+  let cloudClosed;
+  const received = new Promise(resolve => { cloudRequest = resolve; });
+  const closed = new Promise(resolve => { cloudClosed = resolve; });
+  const remote = createServer((req, res) => {
+    res.once('close', cloudClosed);
+    cloudRequest();
+  });
+  const remotePort = await listen(remote);
+  const localApi = await setupApiDir({
+    'displacement/v1/get-displacement-summary.js': 'export default () => Response.json({ dataAvailable: false });',
+  });
+  const app = await createLocalApiServer({
+    port: 0, apiDir: localApi.apiDir,
+    remoteBase: `http://127.0.0.1:${remotePort}`, cloudFallback: 'true', allowPrivateRemoteBase: true,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+  const client = httpRequest(`http://127.0.0.1:${port}/api/displacement/v1/get-displacement-summary`, {
+    headers: { Authorization: `Bearer ${TEST_LOCAL_API_TOKEN}` },
+  });
+  client.on('error', () => {});
+  let deadline;
+  try {
+    const timeout = new Promise((_, reject) => {
+      deadline = setTimeout(() => reject(new Error('cloud proxy disconnect test did not settle within 1s')), 1000);
+    });
+    client.end();
+    await Promise.race([received, timeout]);
+    client.destroy();
+    await Promise.race([closed, timeout]);
+  } finally {
+    clearTimeout(deadline);
+    client.destroy();
+    remote.closeAllConnections();
+    await new Promise(resolve => remote.close(resolve));
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
 // The sidecar default-denies when LOCAL_API_TOKEN is unset (security fix:
 // previously "unset" meant "auth disabled", which made any standalone run
 // an open local-HTTP proxy). Set a stable test token + an authFetch helper
@@ -945,6 +1107,126 @@ test('preserves caller Authorization while hiding the sidecar transport token', 
   }
 });
 
+test('bounds self-hosted register-interest input before the Convex bridge', async (t) => {
+  const originalConvex = process.env.CONVEX_URL;
+  const originalSite = process.env.CONVEX_SITE_URL;
+  const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+  const originalFetch = globalThis.fetch;
+  process.env.CONVEX_URL = 'https://self-hosted.convex.cloud';
+  process.env.CONVEX_SITE_URL = 'http://self-hosted.convex.site';
+  process.env.CONVEX_SERVER_SHARED_SECRET = 'convex-test-secret';
+  let bridgeCalls = 0;
+  globalThis.fetch = async () => {
+    bridgeCalls++;
+    return Response.json({ status: 'registered' });
+  };
+  const localApi = await setupApiDir({});
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const { port } = await app.start();
+  const base = `http://127.0.0.1:${port}`;
+  t.after(async () => {
+    await app.close();
+    await localApi.cleanup();
+    globalThis.fetch = originalFetch;
+    if (originalConvex === undefined) delete process.env.CONVEX_URL;
+    else process.env.CONVEX_URL = originalConvex;
+    if (originalSite === undefined) delete process.env.CONVEX_SITE_URL;
+    else process.env.CONVEX_SITE_URL = originalSite;
+    if (originalSecret === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+    else process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
+  });
+
+  await t.test('rejects a null registration payload', async () => {
+    const response = await postJsonViaHttp(`${base}/api/register-interest`, null);
+    assert.equal(response.status, 400);
+    assert.equal(bridgeCalls, 0);
+  });
+
+  for (const [email, status] of [
+    ['a'.repeat(242) + '@example.com', 200],
+    ['first.last+tag@sub.example.com', 200],
+    ['a'.repeat(243) + '@example.com', 400],
+    ['a@.example.com', 400],
+    ['a@example..com', 400],
+    ['a@example.com.', 400],
+    ['a@' + '.'.repeat(8000) + '@', 400],
+    [42, 400],
+  ]) {
+    await t.test(`email ${String(email).slice(0, 40)} (${String(email).length} characters)`, async () => {
+      const before = bridgeCalls;
+      const response = await postJsonViaHttp(`${base}/api/register-interest`, { email });
+      assert.equal(response.status, status);
+      assert.equal(bridgeCalls - before, status === 200 ? 1 : 0);
+    });
+  }
+
+  const limit = 16 * 1024;
+  const payload = { email: 'valid@example.com', padding: '' };
+  const overhead = Buffer.byteLength(JSON.stringify(payload));
+  for (const bytes of [limit, limit + 1]) {
+    await t.test(`registration body of ${bytes} bytes`, async () => {
+      const before = bridgeCalls;
+      const response = await postJsonViaHttp(`${base}/api/register-interest`, {
+        ...payload, padding: 'x'.repeat(bytes - overhead),
+      });
+      assert.equal(response.status, bytes <= limit ? 200 : 413);
+      assert.equal(bridgeCalls - before, bytes <= limit ? 1 : 0);
+    });
+  }
+  await t.test('counts UTF-8 body bytes rather than characters', async () => {
+    const before = bridgeCalls;
+    const response = await postJsonViaHttp(`${base}/api/register-interest`, {
+      ...payload, padding: 'é'.repeat(limit / 2),
+    });
+    assert.equal(response.status, 413);
+    assert.equal(bridgeCalls, before);
+  });
+
+  for (const declaredLength of [true, false]) {
+    await t.test(`rejects ${declaredLength ? 'declared' : 'chunked'} overflow before upload ends`, async () => {
+      const before = bridgeCalls;
+      const response = await new Promise((resolve, reject) => {
+        const req = httpRequest(`${base}/api/register-interest`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${TEST_LOCAL_API_TOKEN}`,
+            ...(declaredLength ? { 'Content-Length': String(limit + 1) } : {}),
+          },
+        }, (res) => {
+          res.resume();
+          res.on('end', () => {
+            resolve(res.statusCode);
+            req.destroy();
+          });
+        });
+        req.on('error', reject);
+        req.setTimeout(3000, () => req.destroy(new Error('rejection waited for upload completion')));
+        req.flushHeaders();
+        if (!declaredLength) {
+          req.write('x'.repeat(limit));
+          req.write('x');
+        }
+      });
+      assert.equal(response, 413);
+      assert.equal(bridgeCalls, before);
+      assert.equal((await getJsonViaHttp(`${base}/api/local-status`)).status, 200);
+    });
+  }
+  await t.test('rejects overlong email even without a configured bridge secret', async () => {
+    delete process.env.CONVEX_SERVER_SHARED_SECRET;
+    const before = bridgeCalls;
+    const response = await postJsonViaHttp(`${base}/api/register-interest`, {
+      email: 'a'.repeat(243) + '@example.com',
+    });
+    assert.equal(response.status, 400);
+    assert.equal(bridgeCalls, before);
+  });
+});
+
 for (const registrationStatus of ['registered', 'already_registered']) {
   test(`uses the authenticated Convex bridge for self-hosted register-interest (${registrationStatus})`, async () => {
     const originalConvex = process.env.CONVEX_URL;
@@ -1477,14 +1759,12 @@ test('blocks handler global fetches to non-global IPv4 special ranges', async ()
 test('uses asynchronous pinned lookup callback for handler global fetches (#3549)', async () => {
   const originalHttpsRequest = https.request;
   const envSnapshot = {
-    GROQ_API_KEY: process.env.GROQ_API_KEY,
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     OLLAMA_API_URL: process.env.OLLAMA_API_URL,
     LLM_API_URL: process.env.LLM_API_URL,
   };
   let lookupCallbackWasSync = null;
 
-  delete process.env.GROQ_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.OLLAMA_API_URL;
   delete process.env.LLM_API_URL;
@@ -1560,14 +1840,12 @@ test('uses asynchronous pinned lookup callback for handler global fetches (#3549
 test('uses IPv4 sidecar fetch for allowed private-network LLM probes (#3549)', async () => {
   const originalHttpRequest = http.request;
   const envSnapshot = {
-    GROQ_API_KEY: process.env.GROQ_API_KEY,
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     OLLAMA_API_URL: process.env.OLLAMA_API_URL,
     LLM_API_URL: process.env.LLM_API_URL,
   };
   let sawOllamaProbe = false;
 
-  delete process.env.GROQ_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.LLM_API_URL;
   process.env.OLLAMA_API_URL = 'http://ollama.test:11434';
@@ -1628,7 +1906,7 @@ test('uses IPv4 sidecar fetch for allowed private-network LLM probes (#3549)', a
   }
 });
 
-test('reports Groq health for configured keys without a gsk_ prefix (#7126)', async () => {
+test('ignores a leftover GROQ_API_KEY in LLM health (#8885)', async () => {
   const envSnapshot = {
     GROQ_API_KEY: process.env.GROQ_API_KEY,
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
@@ -1642,7 +1920,7 @@ test('reports Groq health for configured keys without a gsk_ prefix (#7126)', as
   });
 
   process.env.GROQ_API_KEY = 'groq-test-key';
-  delete process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = 'openrouter-test-key';
   delete process.env.OLLAMA_API_URL;
   delete process.env.LLM_API_URL;
 
@@ -1659,7 +1937,7 @@ test('reports Groq health for configured keys without a gsk_ prefix (#7126)', as
     assert.equal(response.status, 200);
     assert.equal(response.json.available, true);
     assert.deepEqual(response.json.providers, [
-      { name: 'groq', url: 'https://api.groq.com', available: true },
+      { name: 'openrouter', url: 'https://openrouter.ai', available: true },
     ]);
   } finally {
     restoreHttps();
@@ -1911,6 +2189,20 @@ test('Docker rejects native administration without changing configuration, cache
         assert.equal(response.status, 403);
       });
     }
+    // GHSA-wf3p-9m55-6vm8: nginx matches `\\` literally but the sidecar's URL
+    // parser reads it as `/`, so this spelling slips past nginx's prefix block.
+    // Sent raw because fetch() would normalize it before it left the client.
+    await t.test('a backslash-spelled admin path is still denied', async () => {
+      const status = await new Promise((resolve, reject) => {
+        const req = httpRequest({
+          host: '127.0.0.1', port, method: 'POST', path: '/api/x\\..\\local-env-update',
+          headers: { ...proxyHeaders, 'Content-Type': 'application/json' },
+        }, (res) => { res.resume(); resolve(res.statusCode); });
+        req.on('error', reject);
+        req.end(JSON.stringify({ key: 'WS_RELAY_URL', value: otherRelay }));
+      });
+      assert.equal(status, 403);
+    });
     await t.test('spoofed and native credentials cannot override Docker mode', async () => {
       for (const headers of [{}, { Authorization: `Bearer ${TEST_LOCAL_API_TOKEN}` }, {
         Authorization: 'Bearer caller-oauth', Origin: 'https://tauri.localhost',
@@ -2142,6 +2434,32 @@ test('rejects unknown key via /api/local-env-update', async () => {
   }
 });
 
+test('refuses the retired GROQ_API_KEY on update and validation (#8885)', async () => {
+  const localApi = await setupApiDir({});
+
+  const app = await createLocalApiServer({
+    port: 0,
+    apiDir: localApi.apiDir,
+    logger: { log() { }, warn() { }, error() { } },
+  });
+  const { port } = await app.start();
+
+  try {
+    for (const route of ['local-env-update', 'local-validate-secret']) {
+      const response = await authFetch(`http://127.0.0.1:${port}/api/${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'GROQ_API_KEY', value: 'gsk_stale' }),
+      });
+      assert.equal(response.status, 403, route);
+      assert.equal((await response.json()).error, 'key not in allowlist', route);
+    }
+  } finally {
+    await app.close();
+    await localApi.cleanup();
+  }
+});
+
 test('validates OLLAMA_API_URL via /api/local-validate-secret (reachable endpoint)', async () => {
   // Stand up a mock Ollama server that responds to /v1/models
   const mockOllama = createServer((req, res) => {
@@ -2331,12 +2649,12 @@ test('treats Cloudflare challenge 403 as soft-pass during secret validation', as
 
   try {
     const response = await postJsonViaHttp(`http://127.0.0.1:${port}/api/local-validate-secret`, {
-      key: 'GROQ_API_KEY',
+      key: 'OPENROUTER_API_KEY',
       value: 'dummy-key',
     });
     assert.equal(response.status, 200);
     assert.equal(response.json?.valid, true);
-    assert.equal(response.json?.message, 'Groq key stored (Cloudflare blocked verification)');
+    assert.equal(response.json?.message, 'OpenRouter key stored (Cloudflare blocked verification)');
   } finally {
     restoreHttps();
     await app.close();
@@ -2364,12 +2682,12 @@ test('does not soft-pass provider auth 403 JSON responses even with cf-ray heade
 
   try {
     const response = await postJsonViaHttp(`http://127.0.0.1:${port}/api/local-validate-secret`, {
-      key: 'GROQ_API_KEY',
+      key: 'OPENROUTER_API_KEY',
       value: 'invalid-key',
     });
     assert.equal(response.status, 422);
     assert.equal(response.json?.valid, false);
-    assert.equal(response.json?.message, 'Groq rejected this key');
+    assert.equal(response.json?.message, 'OpenRouter rejected this key');
   } finally {
     restoreHttps();
     await app.close();
@@ -2907,6 +3225,13 @@ test('rss-proxy blocks IPv4-mapped IPv6 literals and DNS answers before transpor
       'https://[::ffff:c0a8:101]/feed.xml',
       'https://[::ffff:a9fe:101]/feed.xml',
       'https://[::ffff:c633:6401]/feed.xml',
+      // Translator and tunnel prefixes carrying a loopback / private IPv4.
+      'https://[64:ff9b::7f00:1]/feed.xml',           // NAT64 -> 127.0.0.1
+      'https://[64:ff9b::a9fe:a9fe]/feed.xml',        // NAT64 -> 169.254.169.254
+      'https://[2002:7f00:1::]/feed.xml',             // 6to4 -> 127.0.0.1
+      'https://[2002:c0a8:101::1]/feed.xml',          // 6to4 -> 192.168.1.1
+      'https://[::7f00:1]/feed.xml',                  // IPv4-compatible -> 127.0.0.1
+      'https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/feed.xml', // Teredo
     ];
     for (const feedUrl of mappedUrls) {
       const response = await authFetch(

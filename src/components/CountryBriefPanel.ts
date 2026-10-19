@@ -1,4 +1,5 @@
-import type { CountryBriefSignals } from '@/types';
+import type { EffectiveTariffRate } from '@/generated/client/worldmonitor/trade/v1/service_client';
+import type { CountrySignalCounts } from '@/types';
 import type { CountryScore } from '@/services/country-instability';
 import type { GetDefenseIndustrialBaseResponse } from '@/generated/client/worldmonitor/military/v1/service_client';
 import type { PredictionMarket } from '@/services/prediction';
@@ -23,6 +24,13 @@ export interface CountryIntelData {
   evidence?: IntelBriefEvidence[];
 }
 
+export interface CountryTariffTrendsData {
+  currentRate: number;
+  trend: string;
+  datapoints: Array<{ year: number; tariffRate: number }>;
+  effectiveTariffRate?: EffectiveTariffRate;
+}
+
 export interface StockIndexData {
   available: boolean;
   code: string;
@@ -41,7 +49,8 @@ export interface CountryDeepDiveSignalItem {
   type: 'MILITARY' | 'PROTEST' | 'CYBER' | 'DISASTER' | 'OUTAGE' | 'OTHER';
   severity: ThreatLevel;
   description: string;
-  timestamp: Date;
+  timestamp: Date | null;
+  source?: string;
 }
 
 export interface CountryDeepDiveSignalDetails {
@@ -60,11 +69,13 @@ export interface CountryDeepDiveBaseSummary {
 }
 
 export interface CountryDeepDiveMilitarySummary {
-  ownFlights: number;
-  foreignFlights: number;
-  nearbyVessels: number;
+  ownFlights: number | null;
+  foreignFlights: number | null;
+  nearbyVessels: number | null;
   nearestBases: CountryDeepDiveBaseSummary[];
-  foreignPresence: boolean;
+  foreignPresence: boolean | null;
+  coverageNotes?: string[];
+  coverage?: 'complete' | 'partial';
 }
 
 export interface CountryDeepDiveEconomicIndicator {
@@ -146,6 +157,7 @@ export interface CountryEnergyProfileData {
   electricityDate: string;
   jodiOilAvailable: boolean;
   jodiOilDataMonth: string;
+  jodiOilObservedMeasurements?: string[];
   gasolineDemandKbd: number;
   gasolineImportsKbd: number;
   dieselDemandKbd: number;
@@ -203,7 +215,8 @@ export interface CountryPortActivityData {
 
 export interface CountryBriefPanel {
   setSectionFailure?(id: import('../../shared/country-brief-sections').BriefSectionId, state: 'locked' | 'unavailable', reason: string): void;
-  show(country: string, code: string, score: CountryScore | null, signals: CountryBriefSignals): void;
+  setSectionCoverage?(id: import('../../shared/country-brief-sections').BriefSectionId, missing: string[]): void;
+  show(country: string, code: string, score: CountryScore | null, signals: CountrySignalCounts): void;
   hide(): void;
   showLoading(): void;
   getCode(): string | null;
@@ -214,14 +227,18 @@ export interface CountryBriefPanel {
   onClose(cb: () => void): void;
   updateBrief(data: CountryIntelData): void;
   updateNews(headlines: NewsItem[]): void;
-  updateMarkets(markets: PredictionMarket[]): void;
+  updateMarkets(markets: PredictionMarket[], metadata?: { fetchedAt?: number }): void;
   updateStock(data: StockIndexData): void;
   updateInfrastructure(code: string): void;
   showGeoError?(onRetry: () => void): void;
-  updateScore?(score: CountryScore | null, signals: CountryBriefSignals): void;
+  updateScore?(score: CountryScore | null, signals: CountrySignalCounts): void;
   isFallbackBrief?(): boolean;
+  updateSignals?(signals: CountrySignalCounts, notes?: readonly string[]): void;
+  getSignalCounts?(): CountrySignalCounts | null;
   updateSignalDetails?(details: CountryDeepDiveSignalDetails): void;
-  updateMilitaryActivity?(summary: CountryDeepDiveMilitarySummary): void;
+  updateQualifiedCountrySignals?(value: import('../../shared/country-signal-observations').QualifiedCountrySignals): void;
+  clearQualifiedCountrySignals?(): void;
+  updateMilitaryActivity?(summary: CountryDeepDiveMilitarySummary | null): void;
   updateDefenseIndustrialBase?(data: GetDefenseIndustrialBaseResponse | null): void;
   syncCountryPremiumSectionsAccess?(hasAccess: boolean): void;
   updateEconomicIndicators?(indicators: CountryDeepDiveEconomicIndicator[]): void;
@@ -237,7 +254,7 @@ export interface CountryBriefPanel {
   updateNationalDebt?(entry: { debtToGdp: number; debtUsd: number; annualGrowth: number; source: string } | null): void;
   updateSanctionsPressure?(data: { entryCount: number; sanctionsActive?: boolean } | null): void;
   updateComtradeFlows?(flows: Array<{ partnerName: string; cmdDesc: string; tradeValueUsd: number; yoyChange: number }> | null): void;
-  updateTariffTrends?(data: { currentRate: number; trend: string; datapoints: Array<{ year: number; tariffRate: number }> } | null): void;
+  updateTariffTrends?(data: CountryTariffTrendsData | null): void;
   updateMultiSectorCostShock?(data: MultiSectorShockResponse | null): void;
   updateProductImports?(data: CountryProductsResponse | null): void;
   updateCommodityVulnerabilities?(data: GetCountryVulnerabilitiesResponse | null): void;

@@ -55,7 +55,7 @@ export const Depth = () => (
       >
         {DEPTH_PROOF_STATS.map(({ value, labelKey }) => (
           <div key={labelKey} className="data-cell text-center flex flex-col">
-            <dt className="font-mono text-[10px] uppercase tracking-widest text-wm-muted mt-2">{t(labelKey)}</dt>
+            <dt className="font-mono text-xs uppercase tracking-widest text-wm-muted mt-2">{t(labelKey)}</dt>
             <dd className="order-first text-3xl md:text-4xl font-display font-bold text-wm-green text-glow">{String(value)}</dd>
           </div>
         ))}
@@ -75,7 +75,7 @@ export const Depth = () => (
           >
             <Icon className="w-5 h-5 text-wm-muted group-hover:text-wm-green transition-colors mb-3" aria-hidden="true" />
             <h3 className="font-bold text-sm mb-1.5">{t(`welcome.depth.n${n}Title`)}</h3>
-            <p className="text-xs text-wm-muted leading-relaxed">{t(`welcome.depth.n${n}Desc`)}</p>
+            <p className="text-xs text-wm-muted leading-relaxed">{t(`welcome.depth.n${n}Desc`, depthProofStats)}</p>
           </motion.a>
         ))}
       </div>

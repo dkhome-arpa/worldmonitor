@@ -5,7 +5,6 @@
  *   1. Relay security  — SSRF guard, auth gate, isPublicRoute, body limit, CORS
  *   2. Widget store    — constants, span-map keys, `cw-` prefix, history trim
  *   3. Title regex     — hyphens in titles (bug fixed: [^\n\-] → [^\n])
- *   4. HTML sanitizer  — allowlist shape, forbidden tags, unsafe style strip
  *   5. Panel guardrails — cw- exclusion in UnifiedSettings, event-handlers
  *   6. SSE event types — html_complete, done, error, tool_call all present
  */
@@ -54,11 +53,16 @@ describe('widget relay spend identity trust', () => {
       const run = vm.runInNewContext(`${functions}\nhandleWidgetAgentRequest`, context);
       for (const relayKey of [undefined, 'legacy-pro-key', 'wrong-secret', 'server-only-secret']) {
         for (const spendId of ['user:rotated-one', 'user:rotated-two']) {
-          await run({ headers: {
-            'x-pro-key': 'legacy-pro-key', 'x-wm-widget-spend-id': spendId,
-            ...(relayKey ? { 'x-relay-key': relayKey } : {}),
-          }, socket: { remoteAddress: '192.0.2.1' } }, {});
-          assert.equal(buckets.at(-1), secret && relayKey === secret ? `id:${spendId}` : '192.0.2.1');
+          // GHSA-rcgv-gv2h-87fp: a direct caller controls these headers, so an
+          // unattested request must not get a fresh bucket by rotating them.
+          for (const ipHeaders of [{}, { 'cf-connecting-ip': '8.8.8.1' }, { 'x-real-ip': '9.9.9.10' }]) {
+            await run({ headers: {
+              'x-pro-key': 'legacy-pro-key', 'x-wm-widget-spend-id': spendId,
+              ...ipHeaders,
+              ...(relayKey ? { 'x-relay-key': relayKey } : {}),
+            }, socket: { remoteAddress: '192.0.2.1' } }, {});
+            assert.equal(buckets.at(-1), secret && relayKey === secret ? `id:${spendId}` : 'key:pro');
+          }
         }
       }
     });
@@ -530,8 +534,7 @@ describe('widget data-tool contracts', () => {
   }
 
   it('lists exactly the FRED series the RPC accepts', () => {
-    const shared = src('server/worldmonitor/economic/v1/_fred-shared.ts');
-    const allowed = [...shared.match(/ALLOWED_FRED_SERIES = new Set<string>\(\[([\s\S]*?)\]\)/)[1].matchAll(/'([A-Z0-9]+)'/g)].map(m => m[1]).sort();
+    const allowed = [...JSON.parse(src('shared/openapi-filter-param-contracts.json')).economicFredSeriesIds].sort();
     assert.ok(allowed.length > 10);
     for (const prompt of prompts) {
       const line = prompt.match(/get-fred-series \(series_id \(required, ONLY one of: ([^;]+);/);
@@ -1718,25 +1721,8 @@ describe('widget-sanitizer — allowlist verification', () => {
     assert.ok(san.includes('FORCE_BODY: true'), 'FORCE_BODY must be true');
   });
 
-  it('post-pass strips url() from style attributes', () => {
-    assert.ok(
-      san.includes('url') && (san.includes('UNSAFE_STYLE') || san.includes('unsafe')),
-      'Must have post-pass regex stripping url() from style values',
-    );
-  });
-
-  it('post-pass strips javascript: from style attributes', () => {
-    assert.ok(
-      san.includes('javascript'),
-      'Must have post-pass regex stripping javascript: from style values',
-    );
-  });
-
-  it('post-pass strips expression() from style attributes', () => {
-    assert.ok(
-      san.includes('expression'),
-      'Must have post-pass regex stripping expression() from style values',
-    );
+  it('style attributes are rebuilt by the declaration allowlist', () => {
+    assert.match(san, /sanitizeWidgetStyle\(/);
   });
 });
 
