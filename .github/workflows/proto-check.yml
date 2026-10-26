@@ -21,6 +21,7 @@ env:
     scripts/_html-entities.mjs
     scripts/apply-openapi-filter-param-schemas.mjs
     scripts/generate-request-validation.mjs
+    scripts/harden-generated-server-errors.mjs
     scripts/generate-scorecard-edge-mirrors.mjs
     scripts/lib/main-module.mjs
     scripts/lib/openapi-codegen.mjs
@@ -50,12 +51,16 @@ env:
     scripts/shared/giving-published-estimate-claims.json
     scripts/shared/iso2-to-region.json
     server/_shared/api-key-rate-limit.ts
+    server/_shared/api-only-paths.ts
     server/_shared/auth-session.ts
     server/_shared/bounded-jmespath.ts
     server/_shared/bounded-json.ts
     server/_shared/cache-contract.ts
     server/_shared/client-ip.ts
+    server/_shared/country-history-access.ts
     server/_shared/deprecation-policy.ts
+    server/_shared/desktop-key-meter.ts
+    server/_shared/desktop-key-principal.ts
     server/_shared/direct-llm-quota.ts
     server/_shared/entitlement-check.ts
     server/_shared/entitlement-coverage.ts
@@ -74,6 +79,7 @@ env:
     server/_shared/sub-request-admission.ts
     server/_shared/usage-identity.ts
     server/_shared/usage.ts
+    server/_shared/user-api-key.ts
     server/auth-session.ts
     server/cors.ts
     server/error-mapper.ts
@@ -93,6 +99,7 @@ env:
     shared/decision-signal-provenance-contract.ts
     shared/decision-signal-provenance-families.ts
     shared/decision-signal-provenance.ts
+    shared/desktop-key-access.js
     shared/embed-access.ts
     shared/embed-panels.ts
     shared/event-triggers.json

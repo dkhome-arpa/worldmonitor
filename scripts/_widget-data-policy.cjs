@@ -127,6 +127,7 @@ const BOOTSTRAP = [
   { key: "techEvents", group: "Science, Health & Society", holds: "125 upcoming tech conferences and events: title, location, start/end date, url" },
   { key: "positiveGeoEvents", group: "Science, Health & Society", holds: "~230 positive-news counts by country and category (e.g. humanity-kindness) with lat/lon" },
   { key: "crossBorderArrivals", group: "Science, Health & Society", holds: "16 UNHCR refugee situations: refugees by host country, returns, Mediterranean monthly arrivals, latest change" },
+  { key: "idmcIduDisplacement", group: "Science, Health & Society", holds: "IDMC internal displacement: ~3,800 located figures from 180 days, per-country 30-day totals and surge flags (~2.5 MB)" },
   { key: "giving", group: "Science, Health & Society", holds: "Global giving summary: estimated daily flow USD, platforms, categories, OECD aid" },
 ];
 
@@ -212,11 +213,14 @@ const EXCLUDED_BOOTSTRAP_KEYS = {
   torontoRoads: "Road/traffic feed, ~2 MB (2,342 records); unusable in a widget",
   bcOpen511: "Road/traffic event feed (DriveBC); not widget data",
   imdCycloneMarine: "IMD marine bulletin text by sea area; map-layer feed, not widget data",
+  notamAirspace: "FAA NMS airspace restriction geometry, ~1.5 MB; map-layer feed, not widget data",
   temporalAnomalies: "Internal anomaly detector output; usually empty",
   aaiiSentiment: "Stale fallback data (fallback=true, last update 2026-04-03)",
 };
 
 const EXCLUDED_RPC_ROUTES = {
+  "/api/displacement/v1/get-cross-border-movements": "Requires source attribution and per-source freshness; use the cross-border displacement panel",
+  "/api/intelligence/v1/get-country-history": "Daily archive is planned and activation-gated; use the country history panel after activation",
   "/api/intelligence/v1/get-country-signal-observations": "Requires an authenticated country panel; unavailable to the anonymous widget session",
   "/api/aviation/v1/get-carrier-ops": "Pro-only (401 for the anonymous widget session)",
   "/api/aviation/v1/get-flight-status": "Pro-only (401 for the anonymous widget session)",

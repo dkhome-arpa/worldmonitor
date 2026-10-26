@@ -16,6 +16,7 @@ import {
 import { getCountryCentroid, ME_STRIKE_BOUNDS } from '@/services/country-geometry';
 import type { CountryScore } from '@/services/country-instability';
 import { t } from '@/services/i18n';
+import { CountryHistory } from './CountryHistory';
 import { getCountryInfrastructure } from '@/services/related-assets';
 import type { PredictionMarket } from '@/services/prediction';
 import type { AssetType, NewsItem, RelatedAsset } from '@/types';
@@ -406,7 +407,9 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
     this.renderSkeleton(country, code, score, signals);
     if (this.source?.mode === 'host') this.renderAtlasExposure(true);
     this.content.scrollTop = 0;
-    this.open();
+    // open() reports only a closed-to-open change. Opened by showLoading(),
+    // the panel now has its real country, so report that too.
+    if (!this.open()) this.onStateChangeCallback?.({ visible: true, maximized: this.isMaximizedState });
   }
 
   public hide(origin: OverlayCloseOrigin = 'control'): void {
@@ -3320,6 +3323,12 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
     const bodyGrid = this.el('div', 'cdp-grid');
     const [signalsCard, signalBody] = this.sectionCard('signals', t('countryBrief.activeSignals'));
     const [timelineCard, timelineBody] = this.sectionCard('timeline', t('countryBrief.timeline'));
+    let historyCard: HTMLElement | undefined;
+    if (this.source?.mode !== 'host') {
+      const [card, body] = this.sectionCard('history', t('countryHistory.title'));
+      historyCard = card;
+      new CountryHistory(body, code, this.signal);
+    }
     const [newsCard, newsBody] = this.sectionCard('news', t('countryBrief.topNews'));
     const [militaryCard, militaryBody] = this.sectionCard('military', t('countryBrief.militaryActivity'));
     const [infraCard, infraBody] = this.sectionCard('infrastructure', t('countryBrief.infrastructure'));
@@ -3469,7 +3478,7 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
     marketsBody.append(this.makeLoading(t('countryBrief.loadingMarkets')));
     briefBody.append(this.makeLoading(t('countryBrief.generatingBrief')));
 
-    bodyGrid.append(fiveFactorScorecardCard, factsCard, ...(chinaSummaryCard ? [chinaSummaryCard] : []), signalsCard, timelineCard, newsCard, militaryCard, sanctionsCard, economicCard, housingCard, debtCard, comtradeCard, tariffCard, tradeCard, costShockCalcCard, productImportsCard, marketsCard, energyCard, maritimeCard, commodityVulnerabilityCard, foodStocksCard, infraCard, demographicsCard);
+    bodyGrid.append(fiveFactorScorecardCard, factsCard, ...(chinaSummaryCard ? [chinaSummaryCard] : []), signalsCard, timelineCard, ...(historyCard ? [historyCard] : []), newsCard, militaryCard, sanctionsCard, economicCard, housingCard, debtCard, comtradeCard, tariffCard, tradeCard, costShockCalcCard, productImportsCard, marketsCard, energyCard, maritimeCard, commodityVulnerabilityCard, foodStocksCard, infraCard, demographicsCard);
     const lead = this.el('div', 'cdp-overview-lead');
     lead.append(briefCard, summaryGrid);
     shell.append(header, lead, bodyGrid);
@@ -3593,9 +3602,9 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
         t,
       ));
     } catch (error) {
-      console.warn('[CountryDeepDivePanel] demographics capability load failed', error);
-      const aborted = (error as { name?: string })?.name === 'AbortError' || signal.aborted;
+      const aborted = (error as { name?: string })?.name === 'AbortError' || signal.aborted || !stillCurrent();
       if (!aborted) {
+        console.warn('[CountryDeepDivePanel] demographics capability load failed', error);
         this.captureCountryDeepDiveLoadFailure(error, code, {
           message: 'Demographics capability load failed',
           widget: 'demographics-capability',
@@ -3661,9 +3670,9 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
       if (!stillCurrent() || !this.canRequestPremium()) return;
       body.replaceChildren(renderFiveFactorScorecardSection(response, t));
     } catch (error) {
-      console.warn('[CountryDeepDivePanel] five-factor scorecard load failed', error);
       const cancelled = signal.aborted || accessSignal.aborted || !stillCurrent();
       if (!cancelled) {
+        console.warn('[CountryDeepDivePanel] five-factor scorecard load failed', error);
         this.captureCountryDeepDiveLoadFailure(error, code, {
           message: 'Five-factor scorecard load failed',
           widget: 'five-factor-scorecard',
@@ -4173,8 +4182,9 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
     this.map.flashAssets(type, assets.map((asset) => asset.id));
   }
 
-  private open(): void {
-    if (this.panel.classList.contains('active')) return;
+  /** Returns true when the panel was closed and is now open. */
+  private open(): boolean {
+    if (this.panel.classList.contains('active')) return false;
     this.lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     this.panel.classList.add('active');
     this.panel.setAttribute('aria-hidden', 'false');
@@ -4187,6 +4197,7 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
       if (this.panel.classList.contains('active')) this.closeButton.focus();
     });
     this.onStateChangeCallback?.({ visible: true, maximized: this.isMaximizedState });
+    return true;
   }
 
   private close(): void {

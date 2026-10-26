@@ -3,6 +3,13 @@
   "schema_version": 1,
   "exceptions": [
     {
+      "path": "api/mcp/registry/country-history-tool.ts",
+      "category": "external-protocol",
+      "reason": "MCP country-history tool definition. It forwards to the generated intelligence RPC with the verified caller's credential and exports no HTTP route.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
       "path": "api/miit-news.js",
       "category": "non-json",
       "reason": "Adapts the fixed official MIIT dated news listing to RSS/XML for the existing browser and server feed readers. Success responses use application/rss+xml; the RSS transport cannot use a JSON proto envelope.",
@@ -48,6 +55,13 @@
       "path": "api/mcp/handler.ts",
       "category": "external-protocol",
       "reason": "MCP transport handler — mcpHandler + default Vercel entry. Extracted from api/mcp.ts during the structural split; same external-protocol constraint as the parent shim.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/mcp/alias.ts",
+      "category": "external-protocol",
+      "reason": "MCP tool-alias table and resolve() for renamed tools/call names. Not an HTTP route. Same external-protocol constraint as the MCP dispatcher.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },
@@ -321,6 +335,13 @@
       "path": "api/mcp/rpc.ts",
       "category": "external-protocol",
       "reason": "MCP JSON-RPC 2.0 envelope helpers (rpcOk + rpcError). Extracted from api/mcp.ts during the structural split; same external-protocol constraint as the parent shim.",
+      "owner": "@SebastienMelki",
+      "removal_issue": null
+    },
+    {
+      "path": "api/mcp/modern.ts",
+      "category": "external-protocol",
+      "reason": "MCP 2026-07-28 (modern era) envelope detection and per-request _meta/header validation for the /mcp handler. Part of the same external-protocol transport, not a JSON data API.",
       "owner": "@SebastienMelki",
       "removal_issue": null
     },
